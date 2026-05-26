@@ -1,20 +1,12 @@
 #!/usr/bin/env python3
 """
-Thesis Trader — main entry point (read this file first).
+Thesis Trader — main entry point.
 
-Linear flow every cycle:
-  1. Load theses from theses.py
-  2. Fetch market data for the active thesis watchlist
-  3. Build a focused Grok prompt from the thesis narrative + data
-  4. Ask Grok for a JSON trade decision
-  5. Run strict risk checks (ABC risk config + SafetyController)
-  6. Execute on IBKR OR simulate locally (paper default)
-  7. Log everything to logs/thesis_trader.jsonl
+Default (``python main.py``):
+  Hybrid mode — mechanical reference signals + Grok rule interpretation
+  for all five configured theses → global risk gates → execute → JSONL log.
 
-Usage:
-  python main.py              # run all enabled theses (max 5)
-  python main.py --thesis id   # run one thesis by id
-  python main.py --list        # show configured theses
+Hidden fallback: ``--legacy-llm`` for original per-thesis Grok-only flow.
 """
 
 from __future__ import annotations
@@ -22,10 +14,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import sys
 
 from glue.bootstrap import assert_paper_mode_safe, bootstrap, execution_backend, is_local_paper_sim
+from glue.executor import execute_decision
 from glue.fetch_data import fetch_for_thesis
+from glue.ibkr_streams import ensure_ibkr_streams
 from glue.paper_broker import PaperBroker
 from glue.prompt_builder import build_system_prompt, build_user_prompt
 from glue.risk_check import evaluate_decision, make_safety_controller
@@ -35,21 +28,7 @@ from theses import Thesis, active_theses
 logger = logging.getLogger(__name__)
 
 
-# ── Step 4: Grok decision ────────────────────────────────────────────────────
-
-
-async def ask_grok(
-    grok,
-    *,
-    system_prompt: str,
-    user_prompt: str,
-    cost_tracker,
-) -> tuple[str, dict]:
-    """
-    Single-turn Grok call (no ReAct loop — keeps this project easy to follow).
-
-    Returns (raw_text, parsed_decision_dict).
-    """
+async def ask_grok(grok, *, system_prompt: str, user_prompt: str, cost_tracker) -> tuple[str, dict]:
     from xai_sdk.chat import system as sdk_system
     from xai_sdk.chat import user as sdk_user
 
@@ -80,48 +59,28 @@ async def ask_grok(
     return raw, decision
 
 
-# ── Step 6: Execution ───────────────────────────────────────────────────────
-
-
-async def execute_decision(gateway, decision: dict, quantity: int) -> dict:
-    """Route a approved buy/sell to the gateway (IBKR or local paper sim)."""
-    action = str(decision.get("action", "hold")).lower()
-    symbol = str(decision.get("symbol", "")).upper()
-    if action == "hold":
-        return {"status": "skipped", "reason": "hold"}
-    side = "BUY" if action == "buy" else "SELL"
-    result = await gateway.place_market_order(symbol, side, quantity)
-    await gateway.refresh_positions()
-    return {"status": "submitted", "side": side, "symbol": symbol, "quantity": quantity, "broker": result}
-
-
 async def build_gateway(data_provider):
-    """
-    Step 0 (per cycle): connect execution backend.
-
-    Default ``EXECUTION_BACKEND=local_sim`` needs no TWS.
-    Set ``EXECUTION_BACKEND=ibkr`` to use copied IBKR execution stack.
-    """
     if is_local_paper_sim():
-        cash = float(__import__("os").getenv("PAPER_STARTING_CASH", "100000"))
+        import os
+
+        cash = float(os.getenv("PAPER_STARTING_CASH", "100000"))
         broker = PaperBroker(initial_cash=cash, data_provider=data_provider)
         await broker.connect()
         return broker
 
     from data.broker_gateway import create_gateway
 
-    gateway = await create_gateway({"broker": {"adapter": "ibkr"}})
-    return gateway
+    return await create_gateway({"broker": {"adapter": "ibkr"}})
 
 
 async def account_snapshot(gateway) -> dict:
-    summary = await gateway.get_account_summary()
     positions = []
     for item in gateway.get_cached_portfolio():
         contract = getattr(item, "contract", item)
         positions.append(
             {
                 "symbol": getattr(contract, "symbol", getattr(item, "symbol", "")),
+                "sec_type": getattr(contract, "secType", "STK"),
                 "qty": getattr(item, "position", 0),
                 "market_value": getattr(item, "marketValue", 0),
             }
@@ -135,10 +94,7 @@ async def account_snapshot(gateway) -> dict:
     }
 
 
-# ── One full thesis cycle ─────────────────────────────────────────────────────
-
-
-async def run_thesis_cycle(
+async def run_legacy_thesis_cycle(
     thesis: Thesis,
     *,
     grok,
@@ -146,28 +102,30 @@ async def run_thesis_cycle(
     cost_tracker,
     trade_log: TradeLogger,
 ) -> None:
-    """Run steps 2–7 for a single thesis."""
-    logger.info("=" * 60)
-    logger.info("Running thesis: %s (%s)", thesis.name, thesis.id)
+    """Hidden legacy LLM-only path (no mechanical reference layer)."""
+    logger.info("Running legacy thesis: %s (%s)", thesis.name, thesis.id)
     trade_log.log_cycle_start(thesis.id, thesis.watchlist)
 
-    # 2) Fetch data
+    stream_info = await ensure_ibkr_streams(thesis.watchlist)
+    trade_log.log_event("ibkr_streams", {"thesis_id": thesis.id, **stream_info})
+
     market_data = fetch_for_thesis(thesis, data_provider)
     trade_log.log_market_data(thesis.id, market_data)
 
-    # Connect broker / paper sim for account context + execution
     gateway = await build_gateway(data_provider)
     safety = make_safety_controller(gateway, cost_tracker)
     acct = await account_snapshot(gateway)
 
-    # 3) Build prompt
     from core.risk_execution_config import get_risk_execution_config
 
     risk = get_risk_execution_config()
-    system_prompt = build_system_prompt(trading_mode=risk.trading_mode, cash_only=risk.cash_only)
+    system_prompt = build_system_prompt(
+        thesis=thesis,
+        trading_mode=risk.trading_mode,
+        cash_only=risk.cash_only,
+    )
     user_prompt = build_user_prompt(thesis, market_data, acct)
 
-    # 4) Grok decision
     raw, decision = await ask_grok(
         grok,
         system_prompt=system_prompt,
@@ -176,43 +134,52 @@ async def run_thesis_cycle(
     )
     trade_log.log_grok_raw(thesis.id, raw)
     trade_log.log_decision(thesis.id, decision)
-    logger.info("Grok decision: %s", decision)
 
-    # 5) Risk check
     verdict = evaluate_decision(
         decision,
-        thesis_watchlist=thesis.watchlist,
+        thesis=thesis,
         gateway=gateway,
         data_provider=data_provider,
         safety=safety,
     )
     trade_log.log_risk(thesis.id, verdict)
     if not verdict.approved:
-        logger.warning("Risk REJECTED: %s", verdict.reason)
         await gateway.disconnect()
         return
     if str(decision.get("action", "hold")).lower() == "hold":
-        logger.info("Grok chose hold — cycle complete.")
         await gateway.disconnect()
         return
 
     qty = verdict.adjusted_quantity or int(decision.get("quantity") or 0)
-
-    # 6) Execute
     exec_result = await execute_decision(gateway, decision, qty)
     trade_log.log_execution(thesis.id, exec_result)
-    logger.info("Execution result: %s", exec_result)
-
     await gateway.disconnect()
 
 
-# ── CLI entry ─────────────────────────────────────────────────────────────────
-
-
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Thesis-driven Grok trader (paper by default)")
+    parser = argparse.ArgumentParser(description="Thesis trader — hybrid rules + Grok (default)")
     parser.add_argument("--thesis", help="Run a single thesis id")
     parser.add_argument("--list", action="store_true", help="List configured theses")
+    parser.add_argument(
+        "--legacy-llm",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--backtest",
+        action="store_true",
+        help="2023-present mechanical backtest simulation",
+    )
+    parser.add_argument(
+        "--backtest-daily",
+        action="store_true",
+        help="Backtest every business day (default: weekly)",
+    )
+    parser.add_argument(
+        "--signals-only",
+        action="store_true",
+        help="Evaluate rules + Grok; log only (no execution)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     return parser.parse_args()
 
@@ -228,17 +195,21 @@ async def async_main() -> int:
 
     global logger
     logger = get_logger(__name__)
-
     assert_paper_mode_safe()
 
+    theses = active_theses()
+
     if args.list:
-        for t in active_theses():
-            print(f"  {t.id:20}  {t.name}  watchlist={','.join(t.watchlist)}")
-        if not active_theses():
-            print("  (no enabled theses — edit theses.py)")
+        for t in theses:
+            print(
+                f"  {t.id:22}  {t.name}  "
+                f"risk={t.base_risk_pct}% alloc={t.max_allocation_pct}%  "
+                f"watchlist={','.join(t.watchlist)}"
+            )
+        if not theses:
+            print("  (no enabled theses)")
         return 0
 
-    theses = active_theses()
     if args.thesis:
         theses = [t for t in theses if t.id == args.thesis]
         if not theses:
@@ -246,30 +217,55 @@ async def async_main() -> int:
             return 1
 
     if not theses:
-        logger.error(
-            "No enabled theses. Open theses.py, add 1–5 strategies, and set enabled=True."
-        )
-        return 1
-    if len(theses) > 5:
-        logger.error("Too many enabled theses (%d). Disable extras in theses.py (max 5).", len(theses))
+        logger.error("No enabled theses in theses.py")
         return 1
 
-    grok = get_grok_llm()
     data_provider = get_data_provider()
     cost_tracker = get_cost_tracker()
     trade_log = TradeLogger()
 
-    # 1) Load theses — done above
-    for thesis in theses:
-        await run_thesis_cycle(
-            thesis,
-            grok=grok,
+    if args.backtest:
+        from glue.backtest_runner import run_backtest
+        from theses_rules.config_bridge import rules_from_theses
+
+        import os
+
+        summary = await run_backtest(
+            rules_from_theses(theses),
             data_provider=data_provider,
             cost_tracker=cost_tracker,
             trade_log=trade_log,
+            daily=args.backtest_daily,
+            starting_cash=float(os.getenv("PAPER_STARTING_CASH", "100000")),
         )
+        logger.info("Backtest complete: %s", summary)
+        return 0
 
-    logger.info("All thesis cycles complete. See logs/thesis_trader.jsonl")
+    if args.legacy_llm:
+        grok = get_grok_llm()
+        for thesis in theses:
+            await run_legacy_thesis_cycle(
+                thesis,
+                grok=grok,
+                data_provider=data_provider,
+                cost_tracker=cost_tracker,
+                trade_log=trade_log,
+            )
+        logger.info("Legacy LLM done. Audit log: logs/thesis_trader.jsonl")
+        return 0
+
+    from glue.hybrid_runner import run_hybrid_cycle
+
+    grok = get_grok_llm()
+    await run_hybrid_cycle(
+        theses,
+        grok=grok,
+        data_provider=data_provider,
+        cost_tracker=cost_tracker,
+        trade_log=trade_log,
+        execute=not args.signals_only,
+    )
+    logger.info("Done. Audit log: logs/thesis_trader.jsonl")
     return 0
 
 

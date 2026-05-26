@@ -1,16 +1,4 @@
-"""Runtime adapter contracts.
-
-These ``Protocol`` classes describe the *minimal* surface that the runtime
-layer (``core.runtime.*``) needs from external dependencies. They exist so
-that the runtime can be unit-tested with lightweight stubs and so that
-implementation modules (``data.broker_gateway``, ``data.market_hours``,
-``data.cost_tracker``) can evolve without forcing matching changes inside
-the agent loop.
-
-These protocols intentionally mirror the *current* duck-typed call sites in
-``core.agent`` — they are not an aspirational redesign. Adding new methods
-must be paired with a characterization test.
-"""
+"""Runtime adapter protocols for broker gateway and cost tracker."""
 
 from __future__ import annotations
 

@@ -1,15 +1,17 @@
 """
-DataProvider - Unified interface for all market data access.
+DataProvider - Unified hybrid market data access.
 
-LAYER 2: Data (Stable Interface)
-Wraps MarketDataClient (official SDK) with source tracking.
+Primary source: **MarketData.app** (quotes, candles, ATR, legacy option chains).
+Optional source: **Polygon** (delta-filtered options snapshots when POLYGON_API_KEY set).
+Optional live quotes: **IBKR streams** when IBKR_QUOTES_ENABLED.
 
 Usage:
     from data.data_provider import get_data_provider
 
     provider = get_data_provider()
-    quote = provider.get_quote('AAPL')  # Returns Quote with source='marketdata' or 'yfinance'
-    atr = provider.get_atr('AAPL')      # Returns ATRResult with value and source
+    quote = provider.get_quote('AAPL')           # MDA / IBKR (unchanged)
+    chain = provider.get_options_chain('AAPL')   # Polygon preferred, MDA fallback
+    moon  = provider.get_lunar_phase()
 """
 
 import asyncio
@@ -481,20 +483,22 @@ def _yf_record_failure(err: Exception) -> None:
 
 class DataProvider:
     """
-    Unified data provider wrapping MarketDataClient (official SDK).
+    Unified hybrid data provider.
 
-    Data sources:
-    - Market Data App (MDA) - quotes, candles, options
-    - yfinance - fundamentals, analyst data, news, screening
-
-    All responses include 'source' field for visibility.
+    Data sources (per call-type):
+    - **Quotes / candles / ATR** — MarketData.app (MARKETDATA_TOKEN); IBKR when streams on
+    - **Options chain (precision)** — Polygon when POLYGON_API_KEY set; else MarketData.app
+    - **Legacy get_option_chain()** — MarketData.app only (backward compatible)
+    - **Fundamentals / news** — yfinance fallbacks
+    - **Lunar phase** — built-in Julian estimate (Astropy planned)
     """
 
     def __init__(self):
         """Initialize the data provider."""
-        # Import from layer2_data (moved from layer1_execution 2026-01-28)
         from data.marketdata_client import get_marketdata_client
+
         self._mda_client = get_marketdata_client()
+        self._polygon_client = None  # lazy — see _polygon()
         self._cache: Dict[str, tuple] = {}  # Per-type TTL cache
         # TTLs in seconds — fast data gets short TTL, slow data gets long TTL
         self._ttl_map = {
@@ -503,7 +507,11 @@ class DataProvider:
             'atr': 60,         # Derived from candles, changes slowly
             'iv_info': 120,    # IV shifts slowly; 2-min cache covers ~4 rounds
             'option_chain': 180, # 3-min cache: Tier 2 reads share across rounds
+            'options_chain': 180,  # hybrid Polygon/MDA chain
             'option_chain_hist': 3600,
+            'lunar_phase': 3600,
+            'vix': 60,
+            'sma': 300,
             'option_quote': 30,
             'option_quote_hist': 3600,
             'option_quote_series': 3600,
@@ -590,6 +598,49 @@ class DataProvider:
     def _set_cached(self, key: str, value: Any):
         """Set cached value with timestamp."""
         self._cache[key] = (value, datetime.now())
+
+    def _polygon(self):
+        """Lazy Polygon client (None-equivalent if POLYGON_API_KEY missing)."""
+        if self._polygon_client is None:
+            from data.polygon_client import get_polygon_client
+
+            self._polygon_client = get_polygon_client()
+        return self._polygon_client
+
+    def _option_chain_from_raw(self, symbol: str, raw: dict) -> OptionChain:
+        """Convert normalized raw chain dict to :class:`OptionChain`."""
+        contracts = []
+        for c in raw.get("contracts") or []:
+            contracts.append(
+                OptionContract(
+                    option_symbol=c.get("option_symbol", ""),
+                    underlying=c.get("underlying", symbol),
+                    strike=c.get("strike", 0),
+                    side=c.get("side", ""),
+                    expiration=self._normalize_expiration(str(c.get("expiration", ""))),
+                    dte=c.get("dte"),
+                    bid=c.get("bid"),
+                    ask=c.get("ask"),
+                    mid=c.get("mid"),
+                    last=c.get("last"),
+                    volume=c.get("volume", 0),
+                    open_interest=c.get("open_interest", 0),
+                    delta=c.get("delta"),
+                    gamma=c.get("gamma"),
+                    theta=c.get("theta"),
+                    vega=c.get("vega"),
+                    iv=c.get("iv"),
+                    source=raw.get("source", "unknown"),
+                    as_of_date=raw.get("as_of_date"),
+                )
+            )
+        return OptionChain(
+            symbol=symbol,
+            contracts=contracts,
+            source=raw.get("source", "unknown"),
+            is_historical=raw.get("is_historical", False),
+            as_of_date=raw.get("as_of_date"),
+        )
 
     # ==================== QUOTES ====================
 
@@ -953,7 +1004,164 @@ class DataProvider:
 
         return None
 
-    # ==================== OPTIONS ====================
+    # ==================== TECHNICALS (SMA / VIX) ====================
+
+    def get_sma(self, symbol: str, period: int = 20) -> Optional[float]:
+        """
+        Simple moving average of daily closes for ``symbol``.
+
+        Uses cached candles from MarketData.app. Pure SMA math lives in
+        :mod:`data.technicals` for unit tests.
+
+        Args:
+            symbol: Stock ticker.
+            period: Lookback days (default 20).
+
+        Returns:
+            SMA value or None if insufficient history.
+        """
+        from data.technicals import sma as _sma
+
+        cache_key = f"sma:{symbol.upper()}:{period}"
+        cached = self._get_cached(cache_key)
+        if cached is not _CACHE_MISS:
+            return cached
+
+        candles = self.get_candles(symbol, days_back=max(period + 10, 30))
+        if not candles or not candles.close:
+            return None
+        value = _sma(candles.close, period)
+        if value is not None:
+            self._set_cached(cache_key, value)
+        return value
+
+    def get_ma(self, symbol: str, period: int = 20) -> Optional[float]:
+        """Moving average alias for :meth:`get_sma` (simple MA in this project)."""
+        from data.technicals import ma as _ma
+
+        cache_key = f"sma:{symbol.upper()}:{period}"
+        cached = self._get_cached(cache_key)
+        if cached is not _CACHE_MISS:
+            return cached
+        candles = self.get_candles(symbol, days_back=max(period + 10, 30))
+        if not candles or not candles.close:
+            return None
+        value = _ma(candles.close, period)
+        if value is not None:
+            self._set_cached(cache_key, value)
+        return value
+
+    def get_ema(self, symbol: str, period: int = 20) -> Optional[float]:
+        """Exponential moving average (pure math in :mod:`data.technicals`)."""
+        from data.technicals import ema as _ema
+
+        cache_key = f"ema:{symbol.upper()}:{period}"
+        cached = self._get_cached(cache_key)
+        if cached is not _CACHE_MISS:
+            return cached
+        candles = self.get_candles(symbol, days_back=max(period + 10, 30))
+        if not candles or not candles.close:
+            return None
+        value = _ema(candles.close, period)
+        if value is not None:
+            self._set_cached(cache_key, value)
+        return value
+
+    def get_sma_context(self, symbol: str, period: int = 20) -> Optional[dict]:
+        """
+        SMA plus last price and percent above/below — handy for Grok prompts.
+
+        Returns:
+            ``{"period", "sma", "last", "vs_sma_pct", "source"}`` or None.
+        """
+        from data.technicals import price_vs_sma_pct
+
+        sma_val = self.get_sma(symbol, period)
+        quote = self.get_quote(symbol)
+        if sma_val is None or quote is None or quote.last is None:
+            return None
+        candles = self.get_candles(symbol, days_back=period + 5)
+        return {
+            "symbol": symbol.upper(),
+            "period": period,
+            "sma": round(sma_val, 4),
+            "last": float(quote.last),
+            "vs_sma_pct": round(price_vs_sma_pct(float(quote.last), sma_val) or 0.0, 3),
+            "source": getattr(candles, "source", "marketdata") if candles else "marketdata",
+        }
+
+    def get_vix(self):
+        """
+        CBOE VIX index level.
+
+        Tries MarketData.app (``VIX`` / ``^VIX``), then yfinance fallback via
+        :func:`data.technicals.fetch_vix_yfinance`.
+
+        Returns:
+            :class:`data.technicals.VixSnapshot` or None.
+        """
+        from data.technicals import fetch_vix_yfinance, parse_vix_from_quote_dict
+
+        cache_key = "vix:spot"
+        cached = self._get_cached(cache_key)
+        if cached is not _CACHE_MISS:
+            return cached
+
+        snap = None
+        for sym in ("VIX", "^VIX"):
+            try:
+                raw = self._run_async(self._mda_client.get_quote(sym))
+                if raw:
+                    snap = parse_vix_from_quote_dict(raw)
+                    if snap is not None:
+                        break
+            except Exception as exc:
+                logger.debug("MDA VIX quote failed for %s: %s", sym, exc)
+
+        if snap is None:
+            snap = fetch_vix_yfinance()
+
+        self._set_cached(cache_key, snap)
+        return snap
+
+    # ==================== LUNAR (Astropy) ====================
+
+    def is_new_moon_window(self, when: Optional[datetime] = None) -> bool:
+        """True during the 14-day post-new-moon bullish window."""
+        from data.MoonCalculator import is_new_moon_window as _is_new
+
+        return _is_new(when)
+
+    def is_full_moon_window(self, when: Optional[datetime] = None) -> bool:
+        """True within ±3 days of full moon (configurable in MoonCalculator)."""
+        from data.MoonCalculator import is_full_moon_window as _is_full
+
+        return _is_full(when)
+
+    def get_lunar_phase(self, when: Optional[datetime] = None):
+        """
+        Lunar phase snapshot via Astropy/ERFA (:mod:`data.MoonCalculator`).
+
+        Args:
+            when: UTC datetime (default: now).
+
+        Returns:
+            :class:`data.MoonCalculator.LunarPhaseSnapshot`
+        """
+        from data.MoonCalculator import get_current_lunar_phase
+
+        # Cache only "now" requests (historical dates bypass cache)
+        if when is None:
+            cache_key = "lunar_phase"
+            cached = self._get_cached(cache_key)
+            if cached is not _CACHE_MISS:
+                return cached
+            phase = get_current_lunar_phase()
+            self._set_cached(cache_key, phase)
+            return phase
+        return get_current_lunar_phase(when)
+
+    # ==================== OPTIONS (hybrid) ====================
 
     def get_option_chain(
         self,
@@ -1030,37 +1238,7 @@ class DataProvider:
             )
 
             if raw and raw.get('contracts'):
-                contracts = []
-                for c in raw['contracts']:
-                    contracts.append(OptionContract(
-                        option_symbol=c.get('option_symbol', ''),
-                        underlying=c.get('underlying', symbol),
-                        strike=c.get('strike', 0),
-                        side=c.get('side', ''),
-                        expiration=self._normalize_expiration(str(c.get('expiration', ''))),
-                        dte=c.get('dte'),
-                        bid=c.get('bid'),
-                        ask=c.get('ask'),
-                        mid=c.get('mid'),
-                        last=c.get('last'),
-                        volume=c.get('volume', 0),
-                        open_interest=c.get('open_interest', 0),
-                        delta=c.get('delta'),
-                        gamma=c.get('gamma'),
-                        theta=c.get('theta'),
-                        vega=c.get('vega'),
-                        iv=c.get('iv'),
-                        source=raw.get('source', 'unknown'),
-                        as_of_date=raw.get('as_of_date'),
-                    ))
-
-                chain = OptionChain(
-                    symbol=symbol,
-                    contracts=contracts,
-                    source=raw.get('source', 'unknown'),
-                    is_historical=raw.get('is_historical', False),
-                    as_of_date=raw.get('as_of_date'),
-                )
+                chain = self._option_chain_from_raw(symbol, raw)
                 self._set_cached(cache_key, chain)
                 return chain
 
@@ -1071,6 +1249,88 @@ class DataProvider:
             self._set_cached(cache_key, None)
 
         return None
+
+    def get_options_chain(
+        self,
+        ticker: str,
+        expiration_range_days: int = 45,
+        min_delta: float = 0.40,
+        max_delta: float = 0.60,
+        data_source: str = "auto",
+    ) -> Optional[OptionChain]:
+        """
+        Hybrid options chain with delta-based strike selection.
+
+        **Routing** (``data_source``):
+        - ``auto`` (default): Polygon if ``POLYGON_API_KEY`` is set, else MarketData.app
+        - ``polygon``: force Polygon; fall back to MDA on failure / missing key
+        - ``marketdata`` / ``mda``: MarketData.app only (same family as legacy method)
+
+        This method is preferred for thesis option strategies that need reliable
+        delta bands (e.g. 0.40–0.60). Existing code using ``get_option_chain()``
+        is unchanged.
+
+        Args:
+            ticker: Underlying symbol (e.g. ``AAPL``).
+            expiration_range_days: Include expirations within this many calendar days.
+            min_delta: Minimum absolute delta (inclusive).
+            max_delta: Maximum absolute delta (inclusive).
+            data_source: ``auto`` | ``polygon`` | ``marketdata`` | ``mda``.
+
+        Returns:
+            :class:`OptionChain` with ``source`` set to ``polygon`` or ``marketdata``.
+        """
+        sym = ticker.upper().strip()
+        src = str(data_source or "auto").strip().lower()
+        cache_key = (
+            f"options_chain:{sym}:{expiration_range_days}:{min_delta}:{max_delta}:{src}"
+        )
+        cached = self._get_cached(cache_key)
+        if cached is not _CACHE_MISS:
+            return cached
+
+        chain: Optional[OptionChain] = None
+
+        # ── Polygon path (preferred for delta precision) ─────────────────
+        try_polygon = src in ("auto", "polygon")
+        if try_polygon and self._polygon().is_configured:
+            try:
+                raw = self._run_async(
+                    self._polygon().get_options_chain_snapshot(
+                        sym,
+                        expiration_range_days=expiration_range_days,
+                        min_delta=min_delta,
+                        max_delta=max_delta,
+                    )
+                )
+                if raw and raw.get("contracts") is not None:
+                    chain = self._option_chain_from_raw(sym, raw)
+                    logger.debug(
+                        "get_options_chain(%s): polygon returned %d contracts",
+                        sym,
+                        len(chain.contracts),
+                    )
+            except Exception as exc:
+                logger.warning("Polygon get_options_chain failed for %s: %s", sym, exc)
+
+        # ── MarketData.app fallback ──────────────────────────────────────
+        if chain is None and src in ("auto", "polygon", "marketdata", "mda"):
+            mda_chain = self.get_option_chain(sym, dte_range=(1, expiration_range_days))
+            if mda_chain is not None:
+                filtered = mda_chain.filter_by_delta(min_delta, max_delta)
+                chain = OptionChain(
+                    symbol=sym,
+                    contracts=filtered,
+                    source=mda_chain.source or "marketdata",
+                )
+                logger.debug(
+                    "get_options_chain(%s): MDA fallback %d contracts after delta filter",
+                    sym,
+                    len(filtered),
+                )
+
+        self._set_cached(cache_key, chain)
+        return chain
 
     def get_option_quote(
         self,

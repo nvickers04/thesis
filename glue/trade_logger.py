@@ -46,6 +46,9 @@ class TradeLogger:
     def log_decision(self, thesis_id: str, decision: dict[str, Any]) -> None:
         self.log_event("grok_decision", {"thesis_id": thesis_id, "decision": decision})
 
+    def log_rules_decision(self, thesis_id: str, decision: dict[str, Any]) -> None:
+        self.log_event("rules_decision", {"thesis_id": thesis_id, "decision": decision})
+
     def log_risk(self, thesis_id: str, verdict: Any) -> None:
         self.log_event(
             "risk_verdict",

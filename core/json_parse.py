@@ -1,8 +1,4 @@
-"""Best-effort JSON parsing helpers for LLM output.
-
-Pure functions with no agent state — import from this module directly.
-Behavior toggles come from :mod:`core.loop_config`.
-"""
+"""Best-effort JSON parsing helpers for Grok decision output."""
 
 from __future__ import annotations
 

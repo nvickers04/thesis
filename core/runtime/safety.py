@@ -1,24 +1,4 @@
-"""SafetyController — extracted loss / drawdown / cost guardrails.
-
-This module hosts the *evaluation* portion of the safety logic that previously
-lived inline on :class:`core.agent.TradingAgent`:
-
-* ``_capture_start_of_day_cash``
-* ``_check_daily_loss``
-* ``_check_intraday_drawdown``
-* ``_check_llm_cost``
-
-Behavior parity with the original implementation is locked by
-``tests/test_runtime_characterization.py``. The numeric formulas, fallback
-chains, and return contracts (``Optional[float]`` percent or ``bool``) are
-preserved verbatim so that the agent's call sites can delegate without any
-observable change.
-
-The actual ``flatten_all`` / halt action is *not* performed here — the agent
-keeps the side-effecting ``_emergency_flatten`` so that future work
-(``EmergencyActions`` per the stabilization plan) can split orchestration
-from policy without disturbing this slice.
-"""
+"""Daily loss, drawdown, and LLM cost guardrails for the thesis trader."""
 
 from __future__ import annotations
 
@@ -78,14 +58,14 @@ class SafetyObserveSnapshot:
         }
 
 
-def safety_controller_from_profit_config(
+def safety_controller_from_config(
     gateway: BrokerGatewayProtocol,
     cost_tracker: CostTrackerProtocol,
 ) -> SafetyController:
-    """Build :class:`SafetyController` from master :func:`~core.central_profit_config.get_profit_config`."""
-    from core.central_profit_config import get_profit_config
+    """Build :class:`SafetyController` from :func:`core.risk_execution_config.get_risk_execution_config`."""
+    from core.risk_execution_config import get_risk_execution_config
 
-    risk = get_profit_config().risk
+    risk = get_risk_execution_config()
     return SafetyController(
         gateway,
         cost_tracker,

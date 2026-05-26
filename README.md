@@ -1,108 +1,109 @@
 # Thesis Grok Trader
 
-A minimal, private, thesis-driven trading runner powered by [Grok (xAI)](https://docs.x.ai/).
+A minimal, thesis-driven trading runner powered by [Grok (xAI)](https://docs.x.ai/).
 
-You define **2–5 clear strategies** in one file (`theses.py`). Each run fetches market data for that thesis's watchlist, asks Grok for a single JSON decision, runs strict risk checks, and either paper-simulates or routes an order through IBKR. No research host, no Postgres, no signal engine, no ReAct agent loop — just a linear pipeline you can read in one sitting.
+Define **strategies** in `theses.py`. Default run: mechanical reference signals + Grok rule interpretation → global risk gates → execute (paper sim or IBKR) → log. **Paper trading is the default.**
 
-**Paper trading is the default everywhere.**
+No ReAct agent loop, no research host, no Postgres, no signal engine.
 
 ---
 
 ## Risk warning
 
-**Trading involves substantial risk of loss.** This software is for education and paper practice.
-
-- Default: `EXECUTION_BACKEND=local_sim` (simulated fills, no broker)
-- Live trading requires **both** `TRADING_MODE=live` **and** `EXECUTION_BACKEND=ibkr`
-- Never trade with money you cannot afford to lose
-- Simulated results do not guarantee future performance
-
----
-
-## Features
-
-- **Thesis-first** — each strategy is a self-contained narrative + watchlist in `theses.py`
-- **Linear flow** — `main.py` is the single source of truth for how a trade happens
-- **Grok decisions** — one JSON response per thesis cycle (`buy` / `sell` / `hold`)
-- **Strict risk gates** — cash-only sizing, min reward:risk, daily loss / drawdown caps
-- **Transparent logging** — every step appended to `logs/thesis_trader.jsonl`
-- **Reused execution stack** — IBKR, MarketData.app, and xAI SDK wired from a proven codebase
+**Trading involves substantial risk of loss.** Defaults are paper-only (`EXECUTION_BACKEND=local_sim`). Live trading requires `TRADING_MODE=live` **and** `EXECUTION_BACKEND=ibkr`. Never risk money you cannot afford to lose.
 
 ---
 
 ## Quick start
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/nvickers04/thesis.git
 cd thesis
 python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
-
+.venv\Scripts\activate          # Windows
 pip install -r requirements.txt
-copy .env.template .env   # or: cp .env.template .env
+copy .env.template .env
 ```
 
-Edit `.env` — minimum required:
-
-| Variable | Purpose |
-|----------|---------|
-| `GROK_API_KEY` or `XAI_API_KEY` | Grok API access |
-| `MARKETDATA_TOKEN` | Real-time quotes (strongly recommended) |
-
-Define strategies in `theses.py` (see commented template), then:
+Set `GROK_API_KEY` and `MARKETDATA_TOKEN` (required for option chains). Edit `theses.py`, then:
 
 ```bash
-python main.py --list              # show enabled theses
-python main.py                     # run all enabled theses (max 5)
-python main.py --thesis my_id      # run one thesis by id
+python main.py --list
+python main.py
 ```
+
+Audit log: `logs/thesis_trader.jsonl`
 
 ---
 
 ## How a trade happens
 
-```mermaid
-flowchart LR
-    A[theses.py] --> B[Fetch market data]
-    B --> C[Build Grok prompt]
-    C --> D[Grok JSON decision]
-    D --> E{Risk check}
-    E -->|pass| F[Execute or paper-sim]
-    E -->|fail| G[Log + skip]
-    F --> H[thesis_trader.jsonl]
-    G --> H
-```
+Read `main.py` — default hybrid flow:
 
-| Step | Module | What happens |
-|------|--------|--------------|
-| 1 | `theses.py` | Load 1–5 enabled theses |
-| 2 | `glue/fetch_data.py` | Quote, candles, ATR, etc. for watchlist |
-| 3 | `glue/prompt_builder.py` | Thesis narrative + data + account snapshot |
-| 4 | `core/grok_llm.py` | Grok returns `{ action, symbol, quantity, ... }` |
-| 5 | `glue/risk_check.py` | Watchlist, sizing, R:R, safety rails |
-| 6 | `glue/paper_broker.py` or `execution/` | Simulated fill (default) or IBKR order |
-| 7 | `glue/trade_logger.py` | Full audit trail |
+| Step | What |
+|------|------|
+| 1 | Load enabled theses from `theses.py` |
+| 2 | Mechanical evaluators produce reference signals (all five theses) |
+| 3 | Fetch market data + account snapshot |
+| 4 | Grok receives full rule sets + signals → JSON allocation per thesis |
+| 5 | Global risk gates + per-thesis risk check |
+| 6 | Execute via `glue/executor.py` → IBKR or paper sim |
+| 7 | Log to JSONL |
 
-Read `main.py` first — every step is commented inline.
+Hidden fallback: `python main.py --legacy-llm` for original per-thesis Grok-only flow (no mechanical layer).
 
 ---
 
 ## Execution modes
 
-| Setting | Behavior |
-|---------|----------|
-| `EXECUTION_BACKEND=local_sim` | **Default.** Simulated cash account. No TWS needed. |
-| `EXECUTION_BACKEND=ibkr` | Routes orders to TWS / IB Gateway (paper port 7497 by default). |
+| `EXECUTION_BACKEND` | Orders |
+|---------------------|--------|
+| `local_sim` (default) | Simulated fills in `glue/paper_broker.py` |
+| `ibkr` | Real orders via `execution/` (paper port 7497 by default) |
 
-| `TRADING_MODE` | Risk profile |
-|----------------|--------------|
-| `paper` | **Default.** 1% risk/trade, 2:1 min R:R |
-| `aggressive_paper` | Higher risk for stress-testing |
-| `live` | Real money — requires explicit IBKR live setup |
+---
+
+## Options support
+
+Theses can set `instruments=["option"]` (or include both `"stock"` and `"option"`).
+
+**Supported strategies** (Grok `option.strategy` field):
+
+| Strategy | Action | Description |
+|----------|--------|-------------|
+| `long_call` | buy | Buy call single-leg |
+| `long_put` | buy | Buy put single-leg |
+| `vertical_spread` | buy | Debit/credit vertical (needs `long_strike`, `short_strike`, `right`) |
+| `close_option` | sell | Close existing long option |
+
+**Data:** add `"option_chain"` to `data_fields` — chains come from **MarketData.app** REST.
+
+**Execution:**
+
+- `EXECUTION_BACKEND=ibkr` → `execution/ibkr_options.py` (TWS required)
+- `EXECUTION_BACKEND=local_sim` → simulated fills in `glue/paper_broker.py`
+
+See the commented example in `theses.py`.
+
+---
+
+## IBKR real-time streams
+
+Live stock quotes can stream from IBKR instead of MarketData.app REST.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `IBKR_STREAMS` | `auto` | `auto` enables streams when `EXECUTION_BACKEND=ibkr` or `TRADING_MODE=live` |
+| `IBKR_QUOTES_ENABLED` | (auto) | Force `1` or `0` |
+| `IBKR_QUOTE_LINE_BUDGET` | `90` | Max concurrent streaming lines |
+
+**Requirements:** TWS or IB Gateway running, API enabled, and your **market data subscriptions** active (works on paper and live accounts).
+
+When streams are on, `DataProvider.get_quote()` uses IBKR NBBO. Option chains still use MarketData.app.
+
+You can use streams for data-only while simulating orders (`EXECUTION_BACKEND=local_sim` + TWS running).
+
+Implementation: `glue/ibkr_streams.py` + `data/ibkr_quote_source.py`.
 
 ---
 
@@ -110,66 +111,82 @@ Read `main.py` first — every step is commented inline.
 
 ```
 thesis/
-├── main.py              # Start here — full linear trading flow
-├── theses.py            # Your strategies (main file to edit)
-├── glue/                # Paper broker, prompts, risk, logging
-├── core/                # Grok SDK + risk configuration
-├── data/                # MarketData.app client + DataProvider
-├── execution/           # IBKR order routing
-├── tools/               # Extended tool handlers (optional)
-├── memory/              # No-op stubs (no database)
-└── logs/                # JSONL audit log (gitignored)
+├── main.py              # Linear flow — start here
+├── theses.py            # Your strategies
+├── glue/                # bootstrap, fetch, prompts, risk, executor, options, streams
+├── core/                # Grok SDK, risk config, safety, JSON parse
+├── data/                # MarketData.app + DataProvider + IBKR quote source
+├── execution/           # IBKR orders (stocks + options)
+└── memory/              # No-op stubs (no database)
 ```
 
 ---
 
 ## Adding a thesis
 
-Open `theses.py` and add a `Thesis(...)` entry:
-
 ```python
 Thesis(
-    id="momentum_large_cap",
-    name="Large-cap momentum",
-    description=(
-        "Look for names holding above the 20-day range with rising volume. "
-        "Only enter when reward:risk is at least 2:1. Hold when trend is unclear."
-    ),
-    watchlist=["AAPL", "MSFT", "NVDA"],
+    id="my_strategy",
+    name="My strategy",
+    description="What Grok should look for...",
+    watchlist=["AAPL", "MSFT"],
     enabled=True,
+    instruments=["stock"],
     data_fields=["quote", "candles", "atr"],
-),
+)
 ```
 
-Grok may **only** pick symbols from `watchlist`. Keep 2–5 theses enabled at once.
+For options, see the commented template in `theses.py`.
 
 ---
 
-## Configuration reference
+## Hybrid mode (default)
 
-Key `.env` variables (see `.env.template` for the full list):
+Five rule-based theses are configured in `theses.py`. Parameters (`base_risk_pct`, `max_allocation_pct`, `dte_range`, `delta_band`, etc.) are fully configurable on each `Thesis` object.
 
-```env
-EXECUTION_BACKEND=local_sim
-PAPER_STARTING_CASH=100000
-TRADING_MODE=paper
-CASH_ONLY=true
-RISK_PER_TRADE=1.0
-MIN_RR=2.0
-MAX_DAILY_LOSS_PCT=15.0
+```bash
+python main.py --list              # show configured theses
+python main.py                     # hybrid cycle (default)
+python main.py --thesis overnight_drift
+python main.py --signals-only      # rules + Grok; log only (no execution)
+python main.py --backtest          # 2023-present mechanical sim (weekly)
+python main.py --backtest --backtest-daily
 ```
+
+**PortfolioManager** aggregates mechanical signals. **Global risk gates**: 8% peak drawdown → block new premium until cash ≥ 50% NLV; max 50% option premium exposure.
+
+Mechanical evaluators live in `theses_rules/rules_based_theses.py` and are wired from `theses.py` via `theses_rules/config_bridge.py`.
 
 ---
 
 ## Requirements
 
 - Python 3.11+
-- Grok API key ([xAI console](https://console.x.ai/))
-- MarketData.app token (recommended)
-- TWS or IB Gateway (only if `EXECUTION_BACKEND=ibkr`)
+- Grok API key
+- MarketData.app token (quotes, candles, ATR, MDA option fallback)
+- Polygon API key (optional — delta-precise option chains)
+- TWS/IB Gateway (optional for streams; required for IBKR execution)
 
 ---
 
-## License
+## Hybrid data layer (MarketData.app + Polygon)
 
-Private project — all rights reserved unless you add a license file.
+| Data type | Primary | Fallback |
+|-----------|---------|----------|
+| Quotes, candles, ATR | MarketData.app | IBKR streams |
+| Options chain (delta filter) | Polygon | MarketData.app |
+| Lunar phase | Astropy (`MoonCalculator`) | — |
+| SMA / VIX | MarketData.app + pure math | yfinance (VIX fallback) |
+
+```python
+from data.data_provider import get_data_provider
+
+p = get_data_provider()
+p.get_options_chain("AAPL", min_delta=0.40, max_delta=0.60, data_source="auto")
+p.get_lunar_phase()
+p.is_new_moon_window()   # 14-day post-new-moon window
+p.get_sma("SPY", period=20)
+p.get_vix()
+```
+
+Pure functions for tests: `data.MoonCalculator.*`, `data.technicals.sma/ma/ema`.
