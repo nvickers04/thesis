@@ -48,11 +48,7 @@ async def ask_grok(grok, *, system_prompt: str, user_prompt: str, cost_tracker) 
 
     usage = getattr(response, "usage", None)
     if usage is not None:
-        cost_tracker.log_llm_usage(
-            grok.model,
-            prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-            completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
-        )
+        cost_tracker.log_llm_usage(grok.model, usage=usage)
 
     objects = _parse_json_objects(raw)
     decision = objects[0] if objects else {"action": "hold", "rationale": "unparseable Grok output"}

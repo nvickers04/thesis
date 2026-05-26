@@ -701,10 +701,21 @@ class IBKRConnector(IBKROrdersMixin, IBKROptionsMixin, IBKRQueriesMixin):
                         self.ib.reqMarketDataType(data_type)
                         logger.info(f"Market data type set to LIVE ({data_type})")
 
-                        # Get account ID
+                        # Get account ID (prefer IBKR_ACCOUNT_ID when set)
                         accounts = self.ib.managedAccounts()
                         if accounts:
-                            self.account_id = accounts[0]
+                            preferred = os.environ.get("IBKR_ACCOUNT_ID", "").strip()
+                            if preferred and preferred in accounts:
+                                self.account_id = preferred
+                            else:
+                                self.account_id = accounts[0]
+                                if preferred and preferred not in accounts:
+                                    logger.warning(
+                                        "IBKR_ACCOUNT_ID=%s not in managed accounts %s; using %s",
+                                        preferred,
+                                        accounts,
+                                        self.account_id,
+                                    )
                             logger.info(f"Connected to IBKR account: {self.account_id}")
 
                             # Fetch account values

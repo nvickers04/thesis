@@ -22,7 +22,7 @@ lxml>=5.0,<6.0
 exchange-calendars>=4.5,<5.0
 
 # Astronomy (lunar phase via MoonCalculator)
-astropy>=6.0,<7.0
+astropy>=7.0,<8.0
 
 # Async
 nest-asyncio>=1.6.0,<2.0
