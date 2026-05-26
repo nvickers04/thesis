@@ -1,0 +1,2161 @@
+"""
+Tool Execution Layer
+
+Direct routing to broker methods. No abstraction, no business logic.
+The agent decides what to call and with what parameters.
+
+AVAILABLE TOOLS (for agent prompt):
+
+=== RESEARCH ===
+research: {query, deep?=false} -> multi-agent web + X search (4 agents default, 16 if deep=true). Use for macro, sentiment, news, earnings, sector analysis.
+quote: {symbol} -> price, bid, ask, volume, change_pct
+candles: {symbol, days?=30, resolution?='D'} -> OHLCV data (resolution: D=daily, H=hourly, 5=5min, 15=15min, 1=1min, W=weekly, M=monthly)
+fundamentals: {symbol} -> sector, industry, market_cap, pe_ratio, earnings_date
+earnings: {symbol} -> next_earnings_date, days_until_earnings
+atr: {symbol, period?=14} -> ATR value and ATR as % of price (for stop calibration)
+iv_info: {symbol, dte_min?=7, dte_max?=45, strike_pct?=auto} -> current IV from ATM options (defaults sample front-month vol; widen DTE for term-structure)
+news: {symbol} -> recent headlines + basic sentiment (positive/negative/neutral)
+analysts: {symbol} -> consensus, price targets, upside_pct, recent upgrades/downgrades
+extended_fundamentals: {symbol} -> short_interest, beta, debt_to_equity, ROE, margins, growth
+institutional_data: {symbol} -> institutional ownership %, top holders
+insider_data: {symbol} -> recent insider buys/sells, net sentiment, transactions
+peer_comparison: {symbol} -> 20-day performance vs sector ETF
+
+=== KNOWLEDGE ===
+market_hours: {} -> current session (premarket/regular/postmarket/closed), next transition time
+budget: {} -> LLM cost tracking, today's P&L, budget remaining
+economic_calendar: {} -> today's macro events (FOMC, NFP, CPI, etc.) + 3-day look-ahead
+
+=== ORDER PLANNING ===
+plan_order: {symbol, side, quantity, urgency?='normal', intent?='entry', execute?=false,
+             stop_distance_pct?, stop_type?='trailing'|'fixed'|'none', trail_pct?,
+             order_type?, limit_price?} -> recommended order type, params, stop, execution
+  Agent overrides: pass stop_distance_pct/stop_type/trail_pct to control your stop.
+                   pass order_type/limit_price to choose your entry order type.
+                   Omit for smart ATR-based defaults.
+
+=== OPTION ENTRY GATEWAY ===
+enter_option: {symbol, strategy, quantity?=1, dte_target?=30, delta_target?=auto, max_spread_pct?=15, execute?=false} -> contract selection + execution
+
+=== ACCOUNT STATE ===
+positions: {} -> all positions with qty, avg_cost, unrealized_pnl
+account: {} -> net_liq, cash_balance, pnl (CASH-ONLY — size orders from cash_balance)
+open_orders: {} -> all open orders with order_id, symbol, action, qty, type, price
+get_position: {symbol} -> single position details
+
+=== ORDER MANAGEMENT ===
+cancel_order: {order_id} -> cancels specific order
+cancel_stops: {symbol} -> cancels all stop orders for symbol (verifies cancellation)
+cancel_all_orphans: {} -> cancels ALL orders for symbols with no position (dangerous orphans!)
+flatten_limits: {} -> cancel open orders and flatten all positions using LIMIT orders at midpoint
+
+=== STOCK ORDERS - BASIC ===
+market_order: {symbol, side, quantity} -> side='BUY'|'SELL'
+limit_order: {symbol, side, quantity, limit_price}
+stop_order: {symbol, side, quantity, stop_price}
+stop_limit: {symbol, side, quantity, stop_price, limit_price}
+trailing_stop: {symbol, quantity, direction, trail_percent} -> direction='LONG'|'SHORT', trail_percent as decimal (0.05 = 5%)
+bracket_order: {symbol, side, quantity, limit_price, stop_loss, take_profit}
+
+=== STOCK ORDERS - ADVANCED ===
+modify_stop: {order_id, new_stop_price} -> adjust stop on existing order
+oca_order: {symbol, quantity, direction, stop_price, target_price} -> OCA stop+target pair
+moc_order: {symbol, side, quantity} -> Market-on-Close (closing auction)
+loc_order: {symbol, side, quantity, limit_price} -> Limit-on-Close
+moo_order: {symbol, side, quantity} -> Market-on-Open (opening auction)
+loo_order: {symbol, side, quantity, limit_price} -> Limit-on-Open
+trailing_stop_limit: {symbol, quantity, direction, trail_amount?, trail_percent?, limit_offset?=0.10}
+adaptive_order: {symbol, side, quantity, order_type?='MKT', limit_price?, priority?='Normal'} -> IBKR adaptive algo
+midprice_order: {symbol, side, quantity, price_cap?} -> pegged to bid/ask midpoint
+relative_order: {symbol, side, quantity, offset?=0.01, limit_price?} -> pegged/relative order
+gtd_order: {symbol, side, quantity, limit_price, good_till_date} -> Good-Till-Date ('YYYYMMDD HH:MM:SS')
+fok_order: {symbol, side, quantity, limit_price} -> Fill-or-Kill
+ioc_order: {symbol, side, quantity, limit_price} -> Immediate-or-Cancel
+
+=== ALGO ORDERS ===
+vwap_order: {symbol, side, quantity, start_time?, end_time?, max_pct_volume?=25} -> VWAP execution
+twap_order: {symbol, side, quantity, start_time?, end_time?} -> TWAP execution
+iceberg_order: {symbol, side, total_quantity, display_size, limit_price} -> hidden size
+snap_mid_order: {symbol, side, quantity} -> snap-to-midpoint pegged
+
+=== OPTIONS - SINGLE LEG ===
+buy_option: {symbol, expiration, strike, right, quantity?=1} -> right='C'|'P', expiration='YYYYMMDD'
+covered_call: {symbol, expiration, strike, shares?=100}
+cash_secured_put: {symbol, expiration, strike, contracts?=1}
+protective_put: {symbol, expiration, strike, shares?=100}
+
+=== OPTIONS - SPREADS ===
+vertical_spread: {symbol, expiration, long_strike, short_strike, right, quantity?=1}
+iron_condor: {symbol, expiration, put_long_strike, put_short_strike, call_short_strike, call_long_strike, quantity?=1}
+iron_butterfly: {symbol, expiration, center_strike, wing_width, quantity?=1}
+straddle: {symbol, expiration, strike, quantity?=1}
+strangle: {symbol, expiration, put_strike, call_strike, quantity?=1}
+collar: {symbol, expiration, put_strike, call_strike, shares?=100}
+calendar_spread: {symbol, strike, near_expiration, far_expiration, right?='C', quantity?=1}
+diagonal_spread: {symbol, near_strike, far_strike, near_expiration, far_expiration, right?='C', quantity?=1}
+butterfly: {symbol, expiration, lower_strike, middle_strike, upper_strike, right?='C', quantity?=1}
+ratio_spread: {symbol, expiration, long_strike, short_strike, right?='C', ratio?=[1,2], quantity?=1}
+jade_lizard: {symbol, expiration, put_strike, call_short_strike, call_long_strike, quantity?=1}
+
+=== OPTIONS - MANAGEMENT ===
+close_option: {symbol, expiration, strike, right, limit_price?} -> auto-midpoint if no limit_price
+close_spread: {symbol} -> closes ALL option legs for a symbol at once (both sides of a spread)
+roll_option: {symbol, old_expiration, old_strike, new_expiration, new_strike, right, quantity?=1}
+option_chain: {symbol, expiration?='YYYY-MM-DD', side?='call'|'put', dte_min?, dte_max?, strike_min?, strike_max?, limit?=20, date?='YYYY-MM-DD'} -> contracts with Greeks; add 'date' for historical snapshot (back to 2005)
+option_quote: {option_symbol, date?='YYYY-MM-DD', from_date?='YYYY-MM-DD', to_date?='YYYY-MM-DD'} -> single contract quote; add date for historical, from_date+to_date for daily series
+option_greeks: {symbol, expiration, strike, right} -> delta, gamma, theta, vega, IV for specific contract
+position_greeks: {symbol?} -> Greeks for all option positions (or filtered by symbol)
+multi_leg: {type, symbol, legs?=[{strike,right,expiration,side},...], ...} -> generic multi-leg dispatcher (debit_spread, iron_condor, calendar, etc.)
+
+=== SIZING ===
+calculate_size: {symbol, side, stop_distance_pct?, risk_per_trade_pct?=1.5, max_position_pct?=20} -> recommended qty + plan_order_params
+
+=== DISCOVERY ===
+instrument_selector: {symbol?, outlook?='bullish'|'bearish'|'neutral'|'volatile', regime?, iv_dte_min?, iv_dte_max?, iv_strike_pct?} -> available instruments/strategies
+
+=== OBSERVABILITY ===
+stats: {} -> comprehensive performance stats (P&L, win rate, positions, LLM costs, action breakdown)
+daily_summary: {} -> generate + persist daily summary to logs/daily_summary.json
+review_trades: {days?=3, sort?='efficiency', symbol?} -> closed trades with efficiency ranking
+signal_breakdown: {symbol} -> per-signal attribution for the symbol's most-recent composite (score, weight, IC, contribution, trust), sorted by |contribution|; reveals which signals drove the consensus and which had no fresh data
+context_quality: {} -> researcher status, memory source (postgres vs local), legacy context quality summary. Lightweight; prefer quality_status() for full matrix policy.
+quality_status: {} -> overall quality snapshot + canonical QualityMatrix (risk, policy, blocked cats, llm config, provenance count). Primary self-calibration for Independent Mode.
+quality_for_symbol: {symbol} -> per-symbol execution history + derived local quality_score from recent trade_feedback (gaps, pnl consistency). Lets agent assess name-specific conviction.
+provenance_audit: {window?, symbol?} -> heavy tool-usage provenance audit: recent ToolUsageRecords + DecisionProvenanceSnapshots (tools active at decisions, context_quality, outcomes). Filterable. The key forensics/visibility tool for Independent Mode staleness diagnosis.
+current_constraints: {} -> live derived policy constraints (risk scaling, entry policy, mode). Pure inspection; agent uses for voluntary adaptation. Enforcement lives elsewhere.
+
+=== WORKING MEMORY ===
+update_working_memory: {section, entry, expires_in_minutes?, metadata?} -> add an interpretation/thesis/verdict/watch-for note. Sections: open_theses (cap 8, EOD), recent_verdicts (cap 12, 30m default), watching_for (cap 10, 60m), regime_notes (cap 5, EOD), lessons_today (cap 8, EOD). Auto-rendered at top of every cycle.
+clear_working_memory_entry: {section, entry_id?} -> remove one entry, or whole section if entry_id omitted
+"""
+
+import json
+import os
+import re
+from datetime import datetime, timezone
+from typing import Any
+
+from core.async_utils import safe_sleep as _safe_sleep
+from core.config import PAPER_AGGRESSIVE
+from core.log_context import get_logger
+from memory import (
+    _atr_bucket,
+    _time_bucket,
+    get_execution_cost,
+    get_graduated_params,
+    set_pending_graduated_param,
+    set_pending_order_context,
+)
+
+logger = get_logger(__name__)
+
+
+# ToolResult and envelope helpers now live in tools.tool_contract — re-exported
+# here for backward compatibility with every caller that did
+# ``from tools.tools_executor import ToolResult``.
+from tools.tool_contract import ToolResult, validate_envelope  # noqa: E402,F401
+from tools.tools_options import _normalize_expiration
+
+# ── plan_order / enter_option handler wrappers ────────────────
+# These are instance methods on ToolExecutor but must live in _REGISTRY
+# so the dispatch chain can reach them like any other handler.
+
+async def _handle_plan_order(executor, params: dict) -> Any:
+    """Wrapper: unpack params dict → ToolExecutor._plan_order(**kw)."""
+    plan = executor._plan_order(
+        symbol=params.get("symbol", ""),
+        side=params.get("side", "BUY"),
+        quantity=int(params.get("quantity", 1)),
+        urgency=params.get("urgency", "normal"),
+        intent=params.get("intent", "entry"),
+        stop_distance_pct=params.get("stop_distance_pct"),
+        stop_type=params.get("stop_type"),
+        trail_pct=params.get("trail_pct"),
+        order_type=params.get("order_type"),
+        limit_price=params.get("limit_price"),
+    )
+    if not params.get("execute"):
+        return plan
+    if os.getenv("ABC_SIMULATION") != "1":
+        return plan
+    rec = str(plan.get("recommendation") or "market_order")
+    if rec == "WAIT":
+        return plan
+    if rec in ("adaptive_order", "midprice_order", "relative_order"):
+        rec = "market_order"
+    dispatch = dict(plan.get("suggested_params") or {})
+    dispatch.setdefault("symbol", plan.get("symbol"))
+    dispatch.setdefault("side", plan.get("side"))
+    dispatch.setdefault("quantity", plan.get("quantity"))
+    exec_result = await executor.execute(rec, dispatch)
+    if isinstance(plan, dict):
+        plan["execution"] = (
+            exec_result.to_dict() if hasattr(exec_result, "to_dict") else exec_result
+        )
+    return plan
+
+
+async def _handle_enter_option(executor, params: dict) -> Any:
+    """Wrapper: unpack params dict → ToolExecutor._enter_option(**kw)."""
+    return executor._enter_option(
+        symbol=params.get("symbol", ""),
+        strategy=params.get("strategy", ""),
+        quantity=int(params.get("quantity", 1)),
+        dte_target=int(params.get("dte_target", 30)),
+        delta_target=params.get("delta_target"),
+        max_spread_pct=float(params.get("max_spread_pct", 15.0)),
+    )
+
+
+
+
+# ── Tool Aliases (common LLM misspellings) ───────────────────
+_ALIASES: dict[str, str] = {
+    "options_chain": "option_chain",
+    "options": "option_chain",
+    "get_options": "option_chain",
+    "get_option_chain": "option_chain",
+    "get_quote": "quote",
+    "get_candles": "candles",
+    "get_atr": "atr",
+    "get_account": "account",
+    "get_positions": "positions",
+    "web_search": "research",
+    "x_search": "research",
+    "deep_research": "research",
+
+    "get_news": "news",
+    "econ_calendar": "economic_calendar",
+    "calendar": "economic_calendar",
+    "macro_events": "economic_calendar",
+    # Robustness: if model outputs {"action":"status"} due nested key collision,
+    # treat it as engine-status intent rather than hard-fail looping.
+    "status": "trader_rules",
+    "engine_status": "trader_rules",
+    "rules_status": "trader_rules",
+    "fundamentals_extended": "extended_fundamentals",
+    "buy_stock": "market_order",
+    "sell_stock": "market_order",
+    "bull_call_spread": "vertical_spread",
+    "bear_put_spread": "vertical_spread",
+    "bear_call_spread": "vertical_spread",
+    "bull_put_spread": "vertical_spread",
+    "call_spread": "vertical_spread",
+    "put_spread": "vertical_spread",
+    "debit_spread": "vertical_spread",
+    "credit_spread": "vertical_spread",
+    # buy/sell verbs pass through to _dispatch where params are restructured
+    # multi-leg convenience aliases
+    "spread": "multi_leg",
+    "multi_leg_order": "multi_leg",
+    # Common LLM action name mistakes
+    "sell_to_close": "close_option",
+    "buy_to_open": "buy_option",
+    "sell_to_open": "buy_option",
+    "close_options": "close_option",
+    "trailing_stop_order": "trailing_stop",
+    "stop_loss": "stop_order",
+    "stop_loss_order": "stop_order",
+    "modify_order": "modify_stop",
+    "cancel": "cancel_order",
+    "flatten": "flatten_limits",
+}
+
+# OCC symbol pattern: e.g. SMCI260220C00031000 or AAPL260321P00250000
+_OCC_RE = re.compile(r'^([A-Z]{1,6})(\d{6})([CP])(\d{8})$')
+
+# Space/underscore-separated option format: "SMCI C31.0 20260220" or "SMCI_C_31_20260220"
+_SPACE_OPT_RE = re.compile(
+    r'^([A-Z]{1,6})\s+([CP])\s*(\d+\.?\d*)\s+(\d{8})$'
+)
+_UNDER_OPT_RE = re.compile(
+    r'^([A-Z]{1,6})_([CP])_(\d+\.?\d*)_(\d{8})$'
+)
+
+def _parse_option_symbol(sym: str) -> dict | None:
+    """Parse ANY option symbol format into components, or None.
+
+    Supports:
+      - OCC: SMCI260220C00031000
+      - Space-separated: SMCI C31.0 20260220
+      - Underscore-separated: SMCI_C_31_20260220
+    """
+    s = (sym or "").upper().strip()
+    if not s:
+        return None
+
+    # Try OCC first
+    m = _OCC_RE.match(s)
+    if m:
+        underlying, date_str, right_char, strike_raw = m.groups()
+        return {
+            "underlying": underlying,
+            "expiration": f"20{date_str}",
+            "strike": int(strike_raw) / 1000.0,
+            "right": right_char,
+        }
+
+    # Try space-separated: "SMCI C31.0 20260220" or "SMCI C 31.0 20260220"
+    m = _SPACE_OPT_RE.match(s)
+    if not m:
+        # Also try variant with space between right and strike
+        m2 = re.match(r'^([A-Z]{1,6})\s+([CP])\s+(\d+\.?\d*)\s+(\d{8})$', s)
+        if m2:
+            m = m2
+    if m:
+        underlying, right_char, strike_str, expiration = m.groups()
+        return {
+            "underlying": underlying,
+            "expiration": expiration,
+            "strike": float(strike_str),
+            "right": right_char,
+        }
+
+    # Try underscore-separated: "SMCI_C_31_20260220"
+    m = _UNDER_OPT_RE.match(s)
+    if m:
+        underlying, right_char, strike_str, expiration = m.groups()
+        return {
+            "underlying": underlying,
+            "expiration": expiration,
+            "strike": float(strike_str),
+            "right": right_char,
+        }
+
+    return None
+
+# Backward compat alias
+_parse_occ_symbol = _parse_option_symbol
+
+
+def merge_bare_stock_entry_advisory(action: str, params: dict | None, result: Any) -> Any:
+    """Attach ``data_warning`` when a stock market/limit entry bypasses ``plan_order`` context.
+
+    Advisory only — never blocks execution. Disable with env
+    ``DISABLE_BARE_STOCK_ENTRY_ADVISORY=true``.
+    """
+    if os.environ.get("DISABLE_BARE_STOCK_ENTRY_ADVISORY", "").lower() in ("1", "true", "yes"):
+        return result
+    if action not in ("market_order", "limit_order"):
+        return result
+    if not isinstance(result, dict):
+        return result
+    if result.get("error"):
+        return result
+    if result.get("success") is False:
+        return result
+    params = params or {}
+    sym_raw = params.get("symbol")
+    if not isinstance(sym_raw, str) or not sym_raw.strip():
+        return result
+    sym = sym_raw.strip().upper()
+    if _parse_option_symbol(sym):
+        return result
+    intent = str(params.get("intent") or "entry").lower()
+    if intent in ("exit", "close", "trim", "reduce", "rotation", "protect"):
+        return result
+    try:
+        from memory import get_pending_order_context
+
+        if get_pending_order_context(sym):
+            return result
+    except Exception:
+        pass
+    msg = (
+        "Advisory: stock market/limit order without a recent plan_order context for this symbol. "
+        "Prefer plan_order or bracket_order for day-trade entries so size/stop intent is explicit."
+    )
+    out = dict(result)
+    prev = out.get("data_warning")
+    out["data_warning"] = f"{prev}; {msg}" if prev else msg
+    return out
+
+
+# Inline order action names (replaces deleted tool_registry dependency)
+_ORDER_ACTIONS = {
+    "market_order", "limit_order", "stop_order", "stop_limit",
+    "trailing_stop", "bracket_order", "modify_stop", "oca_order",
+    "flatten_limits", "moc_order", "loc_order", "moo_order", "loo_order",
+    "trailing_stop_limit", "adaptive_order", "midprice_order", "relative_order",
+    "gtd_order", "fok_order", "ioc_order", "vwap_order", "twap_order",
+    "iceberg_order", "snap_mid_order", "close_position",
+    "buy_option", "covered_call", "cash_secured_put", "protective_put",
+    "vertical_spread", "iron_condor", "iron_butterfly", "straddle",
+    "strangle", "collar", "calendar_spread", "diagonal_spread",
+    "butterfly", "ratio_spread", "jade_lizard", "close_option", "close_spread", "roll_option",
+    "plan_order", "enter_option", "multi_leg",
+}
+
+# Order actions that close/exit existing exposure — exempt from the
+# universe guard so the agent can always reduce risk on a name even if
+# it has been removed from RESEARCH_UNIVERSE since entry.
+_EXIT_ORDER_ACTIONS = {
+    "close_position", "close_option", "close_spread", "roll_option",
+    "modify_stop", "flatten_limits",
+}
+
+
+def _allowed_trade_universe() -> set[str]:
+    """Symbols the agent is permitted to OPEN new exposure in.
+
+    = RESEARCH_UNIVERSE  ∪  active attention triggers  ∪  symbols with
+    a current open position.  Closing/rolling existing exposure is
+    always allowed (see ``_EXIT_ORDER_ACTIONS``).
+
+    Fail-soft: on any error returns an empty set, which makes the guard
+    block all NEW entries — the safe default if we can't read the DB.
+    """
+    allowed: set[str] = set()
+    try:
+        from research.config import RESEARCH_UNIVERSE
+        allowed.update(s.upper() for s in RESEARCH_UNIVERSE if isinstance(s, str))
+    except Exception:
+        pass
+    try:
+        from core.runtime.focus_universe import get_focus_symbols
+        from memory import get_db
+        from core.memory_config import get_memory_config
+
+        allowed.update(
+            get_focus_symbols(
+                get_db(),
+                limit=get_memory_config().focus_symbols_trade_universe_limit,
+            )
+        )
+    except Exception:
+        pass
+    return allowed
+
+
+def get_valid_actions() -> list[str]:
+    """Return sorted list of enabled agent-callable tools from :mod:`core.tool_registry`."""
+    from core.tool_registry import get_tool_registry
+
+    return get_tool_registry().agent_action_names()
+
+
+def __getattr__(name: str) -> Any:
+    """Lazy access to handler map (backward compat for ``_REGISTRY``)."""
+    if name == "_REGISTRY":
+        from core.tool_registry import get_tool_registry
+
+        return get_tool_registry().handlers
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+class ToolExecutor:
+
+    _OPTION_STRATEGY_DEFAULTS = {
+        "long_call":        (0.40, 21, 45),
+        "long_put":         (0.40, 21, 45),
+        "bull_call_spread": (0.40, 21, 45),
+        "bear_put_spread":  (0.40, 21, 45),
+        "iron_condor":      (0.16, 30, 60),
+        "covered_call":     (0.30, 14, 30),
+        "cash_secured_put": (0.30, 14, 30),
+        "protective_put":   (0.30, 30, 60),
+        "straddle":         (0.50, 21, 45),
+        "strangle":         (0.25, 21, 45),
+    }
+
+    def __init__(self, gateway, data_provider, market_hours_provider=None, cost_tracker=None):
+        self.gateway = gateway
+        self.data_provider = data_provider
+        self.market_hours_provider = market_hours_provider
+        self.cost_tracker = cost_tracker
+        self._protective_order_actions = {"stop_order", "stop_limit", "trailing_stop", "trailing_stop_limit"}
+        self._deferred_stops = []
+        self._recent_orders: dict[str, float] = {}  # fingerprint → timestamp for idempotency
+        # Order action names for structured trade logging
+        self._order_actions = _ORDER_ACTIONS
+
+        from core.config import CASH_ONLY
+
+        self.cash_only = CASH_ONLY
+
+        if self.market_hours_provider is None:
+            from data.market_hours import get_market_hours_provider
+            self.market_hours_provider = get_market_hours_provider()
+
+        # Deferred stops removed in minimal build
+
+    async def _refresh_state(self):
+        """Refresh positions/account from broker after order placement."""
+        try:
+            await self.gateway.refresh_positions()
+        except Exception as e:
+            logger.warning(f"State refresh failed: {e}")
+
+    async def _close_position(self, symbol: str, quantity: int | None = None, reason: str = "") -> dict:
+        """Close a single position: cancel its stops then market-close.
+
+        Handles stock (long/short) and option positions.  If *quantity* is
+        ``None`` the full position size is used.  Returns a result dict.
+        """
+        symbol = symbol.upper()
+        pos = await self.gateway.get_position(symbol)
+        if pos is None:
+            return {"error": f"No open position for {symbol}"}
+
+        pos_qty = pos.get("quantity", 0)
+        qty = quantity if quantity is not None else abs(int(pos_qty))
+        if qty <= 0:
+            return {"error": f"Invalid quantity {qty} for {symbol}"}
+
+        is_long = pos_qty > 0
+        is_option = pos.get("sec_type") == "OPT"
+
+        # 1. Cancel protective stops for this symbol
+        try:
+            underlying = symbol.split("_")[0]
+            await self.gateway.cancel_stops(underlying)
+        except Exception as e:
+            logger.warning(f"_close_position: cancel_stops failed for {symbol}: {e}")
+
+        # 2. Place closing order
+        try:
+            if is_option:
+                parts = symbol.split("_")  # SYMBOL_RIGHT_STRIKE_EXPIRY
+                close_params: dict = {"symbol": parts[0]}
+                if len(parts) >= 4:
+                    close_params["right"] = parts[1]
+                    close_params["strike"] = float(parts[2])
+                    close_params["expiration"] = parts[3]
+                close_params["quantity"] = qty
+                close_params["reason"] = reason or "close_position"
+                result = await self.gateway.close_option_position(**close_params)
+            else:
+                side = "SELL" if is_long else "BUY"
+                result = await self.gateway.place_market_order(symbol, side, qty)
+        except Exception as e:
+            logger.error(f"_close_position: close order failed for {symbol}: {e}")
+            return {"error": f"Close order failed: {e}", "symbol": symbol}
+
+        await self._refresh_state()
+
+        logger.info(f"_close_position: closed {qty} {symbol} — {reason}")
+        return {
+            "success": True,
+            "symbol": symbol,
+            "quantity": qty,
+            "side": "SELL" if is_long else "BUY",
+            "reason": reason,
+            "result": result,
+        }
+
+    def _check_pdt(self, side: str):
+        """PDT gate — disabled.
+
+        The SEC removed the $25k Pattern Day Trader minimum, so this rule
+        no longer applies.  The function is kept (rather than deleted) so
+        existing call sites in tools_options.py keep working without code
+        changes; it now always returns ``None`` (no block).
+        """
+        return None
+
+    # Option tools that should never be blocked by cash-only guard
+    _OPTION_ACTIONS_SKIP_CASH_CHECK = {
+        "close_option", "roll_option", "buy_option", "covered_call",
+        "cash_secured_put", "protective_put", "vertical_spread",
+        "iron_condor", "iron_butterfly", "straddle", "strangle",
+        "collar", "calendar_spread", "diagonal_spread", "butterfly",
+        "ratio_spread", "jade_lizard", "multi_leg", "enter_option",
+        "option_chain", "option_greeks", "option_quote", "position_greeks",
+        "close_spread",
+        # Position management tools — these modify/protect existing positions,
+        # never open naked shorts. Trailing stops and OCA always need an existing position.
+        "trailing_stop", "trailing_stop_limit", "oca_order",
+        "modify_stop", "flatten_limits",
+    }
+
+    def _check_cash_only(self, side: str, symbol: str, intent: str = "entry") -> dict | None:
+        """STRICT cash-only guardrail: block orders that would create a short STOCK position.
+
+        Returns error dict if blocked, None if allowed.
+        Rules:
+        - BUY side → always allowed
+        - SELL side → allowed if we hold a long position in the symbol
+        - OCC option symbols → allowed (option closes are not short stock)
+        """
+        if not self.cash_only:
+            return None
+        if side.upper() != "SELL":
+            return None  # BUY always OK in cash-only
+
+        # If the symbol looks like an OCC option symbol, allow it —
+        # this is closing/selling an option contract, not shorting stock.
+        if _parse_occ_symbol(symbol):
+            return None
+
+        # SELL is only allowed if we hold a long position in this symbol.
+        # Check cached portfolio synchronously to avoid async in this guard.
+        # Match on underlying symbol so "SMCI" matches both stock and option positions.
+        _sym = (symbol or "").upper().split("_")[0]  # strip option suffixes like SMCI_C_31_20260220
+        portfolio = self.gateway.get_cached_portfolio() if self.gateway else []
+        for item in portfolio:
+            if (item.contract.symbol.upper() == _sym and item.position > 0):
+                return None  # selling shares/contracts we own — allowed
+        return {
+            "error": f"CASH-ONLY BLOCKED: Cannot SELL {symbol} — no long position held. "
+                     f"Cash accounts cannot open short stock positions. "
+                     f"For bearish views, use long puts or bear put spreads instead."
+        }
+
+    def _check_cash(self, estimated_cost: float):
+        """Block if estimated cost exceeds available cash. Returns error dict or None.
+
+        CASH-ONLY account: Uses TotalCashValue (actual settled cash).
+        AvailableFunds on IBKR paper includes margin purchasing power,
+        which would allow buying on margin — we MUST NOT do that.
+        """
+        if not self.gateway:
+            return None
+        # ALWAYS use TotalCashValue (actual cash) for cash-only accounts.
+        # AvailableFunds includes margin purchasing power on IBKR paper.
+        cash = self.gateway.cash_value
+        if cash <= 0:
+            # Refresh from account values subscription
+            try:
+                for av in self.gateway.get_cached_account_values():
+                    if av.tag == 'TotalCashValue' and av.currency == 'USD':
+                        cash = float(av.value)
+                        self.gateway.cash_value = cash
+                        break
+            except Exception as e:
+                logger.debug(f"Cash value refresh failed: {e}")
+        if cash <= 0:
+            return {
+                "error": f"CASH-ONLY: insufficient cash. "
+                         f"Required: ~${estimated_cost:,.2f}, Available cash: ${cash:,.2f}"
+            }
+        if estimated_cost > cash:
+            return {
+                "error": f"CASH-ONLY: insufficient cash. "
+                         f"Required: ~${estimated_cost:,.2f}, Available cash: ${cash:,.2f}"
+            }
+        return None
+
+    def _standardize_tool_payload(self, result: Any) -> dict:
+        """Normalize all tool outputs to a flat envelope shape.
+
+        Keys 'success', 'error', 'is_realtime', 'data_warning' are envelope metadata.
+        All other keys from the handler result are merged at top level (no 'data' wrapper).
+        """
+        if isinstance(result, dict):
+            # Already a full envelope — pass through
+            if all(k in result for k in ("success", "data", "error", "is_realtime", "data_warning")):
+                payload = dict(result)
+                payload["success"] = bool(payload.get("success"))
+                payload["error"] = str(payload["error"]) if payload.get("error") is not None else None
+                payload["is_realtime"] = bool(payload.get("is_realtime", False))
+                return payload
+
+            error_text = result.get("error")
+            if "success" in result and result.get("success") is False and error_text is None:
+                error_text = result.get("reason") or result.get("warning")
+            if "success" in result and result.get("success") is False and error_text is None:
+                error_text = "Order failed (no detail returned)"
+            success = bool(result.get("success")) if "success" in result else (error_text is None)
+            is_realtime = bool(result.pop("is_realtime", False)) if isinstance(result, dict) else False
+            data_warning = result.pop("data_warning", None) if isinstance(result, dict) else None
+
+            # Flat merge: envelope keys + all handler keys at top level
+            payload = {
+                "success": success,
+                "error": str(error_text) if error_text is not None else None,
+                "is_realtime": is_realtime,
+                "data_warning": data_warning,
+            }
+            for k, v in result.items():
+                if k not in payload:
+                    payload[k] = v
+            return payload
+
+        return {
+            "success": True,
+            "error": None,
+            "is_realtime": False,
+            "data_warning": None,
+            "data": result,
+        }
+
+    def _record_tool_for_quality_matrix(self, action: str, params: dict | None, success: bool) -> None:
+        """Record tool usage for QualityMatrix provenance.
+
+        Called for every tool attempt that reaches execution (including hard-rejected
+        by QualityMatrix gate or universe guard, and successful dispatches).
+        Records via the canonical QualityMatrixService so provenance is decision-scoped
+        and durable. Latency left at 0.0 for v1 (real timing can be added later without
+        changing the contract).
+        """
+        try:
+            from datetime import datetime as _dt
+            from datetime import timezone as _tz
+
+            from core.quality.quality_matrix import ToolUsageRecord, get_quality_matrix_service
+
+            svc = get_quality_matrix_service()
+            sym = (params or {}).get("symbol") if isinstance(params, dict) else None
+            if isinstance(sym, str):
+                sym = sym.strip().upper() or None
+            rec = ToolUsageRecord(
+                tool_name=action,
+                called_at=_dt.now(_tz.utc),
+                symbol=sym,
+                success=bool(success),
+                latency_ms=0.0,
+                source="executor",
+                context={"param_keys": list((params or {}).keys())[:6] if isinstance(params, dict) else []},
+            )
+            svc.record_tool_usage(rec)
+        except Exception as _rec_err:
+            # Never let provenance logging break tool execution
+            logger.debug("QualityMatrix tool record (executor) skipped: %s", _rec_err)
+
+    def _plan_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        urgency: str = "normal",
+        intent: str = "entry",
+        # --- Agent-controlled overrides ---
+        stop_distance_pct: float = None,  # Override auto stop distance (e.g. 5.0 = 5%)
+        stop_type: str = None,            # "trailing", "fixed", "none" — override auto stop type
+        trail_pct: float = None,          # Override trailing % as decimal (0.05 = 5%)
+        order_type: str = None,           # Override entry order type (e.g. "limit_order", "market_order")
+        limit_price: float = None,        # For limit order override
+    ) -> dict:
+        """
+        Order-type recommender with agent overrides.
+
+        If the agent passes stop/order params, those are used.
+        Otherwise falls back to the auto decision tree.
+        """
+        # Fetch quote, ATR, and earnings concurrently (all independent)
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            quote_fut = pool.submit(self.data_provider.get_quote, symbol)
+            atr_fut = pool.submit(self.data_provider.get_atr, symbol)
+            earnings_fut = pool.submit(self.data_provider.get_earnings_info, symbol)
+            quote = quote_fut.result()
+            atr_result = atr_fut.result()
+            earnings = earnings_fut.result()
+
+        session_info = self.market_hours_provider.get_session_info()
+        session = session_info.get("session", "closed")
+
+        iv_info = None
+        # IV info requires agent-provided DTE params; skip in auto order planning
+
+        price = None
+        bid = None
+        ask = None
+        spread = None
+        spread_pct = None
+        volume = None
+
+        if quote:
+            if isinstance(quote, dict):
+                price = quote.get("last") or quote.get("close")
+                bid = quote.get("bid")
+                ask = quote.get("ask")
+                volume = quote.get("volume")
+                mid = (
+                    (float(bid) + float(ask)) / 2.0
+                    if bid and ask
+                    else float(price) if price else None
+                )
+            else:
+                price = quote.last
+                bid = quote.bid
+                ask = quote.ask
+                volume = quote.volume
+                mid = quote.mid
+            if bid and ask and bid > 0 and ask > 0 and mid and mid > 0:
+                spread = round(ask - bid, 4)
+                spread_pct = round(spread / mid * 100, 4)
+
+        atr_value = atr_result.value if atr_result else None
+        atr_pct = None
+        if atr_value and price and price > 0:
+            atr_pct = round(atr_value / price * 100, 2)
+
+        days_to_earnings = None
+        if earnings and earnings.days_until_earnings is not None:
+            days_to_earnings = earnings.days_until_earnings
+
+        # Use pre-computed values from market_hours provider
+        minutes_to_open = session_info.get("minutes_to_open")
+        minutes_to_close = session_info.get("minutes_to_close")
+
+        # ── Graduated param overrides (from execution autoresearch) ──
+        # Loaded here, applied after the decision tree sets `recommended`.
+        graduated_override = None
+        graduated_param_id = None
+        _graduated_params_list = []
+        try:
+            _gp_tb = _time_bucket(datetime.now(timezone.utc).isoformat())
+            _gp_ab = _atr_bucket(atr_pct)
+            _graduated_params_list = get_graduated_params(active_only=True)
+        except Exception as e:
+            logger.debug(f"Graduated params load failed: {e}")
+
+        # --- Order type override or auto decision tree ---
+        if order_type and intent != "stop":
+            # Agent explicitly chose the order type
+            reasons = [f"Agent override: {order_type}"]
+            suggested_params = {"symbol": symbol, "side": side, "quantity": quantity}
+            if limit_price is not None:
+                suggested_params["limit_price"] = round(float(limit_price), 2)
+            if order_type == "trailing_stop":
+                suggested_params["direction"] = "LONG" if side == "BUY" else "SHORT"
+                if trail_pct:
+                    suggested_params["trail_percent"] = float(trail_pct)
+            recommended = order_type
+        elif intent == "stop":
+            recommended, reasons, suggested_params = self._plan_stop(
+                symbol, side, quantity, price, atr_value, atr_pct,
+                days_to_earnings, spread, spread_pct
+            )
+        elif intent == "exit":
+            recommended, reasons, suggested_params = self._plan_exit(
+                symbol, side, quantity, price, urgency, session,
+                spread, spread_pct, minutes_to_close
+            )
+        else:
+            recommended, reasons, suggested_params = self._plan_entry(
+                symbol, side, quantity, price, urgency, session,
+                spread, spread_pct, minutes_to_open, minutes_to_close,
+                atr_pct, limit_price=limit_price
+            )
+
+        # Match graduated params now that `recommended` is known
+        if _graduated_params_list and not order_type:
+            # Decision tree returns "market_order", "adaptive_order", etc.
+            # Param key uses canonical: "market", "adaptive", etc.
+            _match_ot = recommended.removesuffix("_order") if isinstance(recommended, str) else recommended
+            best_specificity = -1
+            for p in _graduated_params_list:
+                pk = p["param_key"]
+                parts = pk.split(".")
+                if len(parts) != 4:
+                    continue
+                pk_ot, pk_intent, pk_tb, pk_ab = parts
+                # All 4 components must match (exact or 'all' wildcard)
+                if not (pk_ot == _match_ot or pk_ot == "all"):
+                    continue
+                if not (pk_intent == intent or pk_intent == "all"):
+                    continue
+                if not (pk_tb == _gp_tb or pk_tb == "all"):
+                    continue
+                if not (pk_ab == _gp_ab or pk_ab == "all"):
+                    continue
+                # Prefer more specific params (fewer 'all' wildcards)
+                specificity = sum(1 for v in (pk_ot, pk_intent, pk_tb, pk_ab) if v != "all")
+                if specificity > best_specificity:
+                    best_specificity = specificity
+                    graduated_override = p["param_value"]
+                    graduated_param_id = p["id"]
+
+        # Apply graduated param override (only if agent didn't explicitly choose)
+        if graduated_override and not order_type:
+            reasons.append(f"Graduated override: {graduated_override} (from execution research)")
+            # Append _order suffix to stay consistent with decision tree naming
+            recommended = f"{graduated_override}_order"
+
+        # Store graduated_param_id for snapshot linkage when order is placed
+        if graduated_param_id is not None:
+            try:
+                set_pending_graduated_param(symbol, graduated_param_id)
+            except Exception as e:
+                logger.warning(f"Failed to store pending graduated param for {symbol}: {e}")
+
+        # Store order context (intent, atr_pct) for snapshot capture
+        try:
+            set_pending_order_context(symbol, {"intent": intent, "atr_pct": atr_pct})
+        except Exception as e:
+            logger.warning(f"Failed to store pending order context for {symbol}: {e}")
+
+        # --- Stop recommendation: agent override or auto ---
+        stop_rec = None
+        if intent not in ("stop", "exit") and price:
+            if stop_type == "none":
+                # Agent explicitly says no stop
+                stop_rec = None
+            elif stop_type or stop_distance_pct or trail_pct:
+                # Agent provided stop params — build stop from those
+                stop_rec = self._build_agent_stop(
+                    price=price, side=side, atr_value=atr_value, atr_pct=atr_pct,
+                    stop_distance_pct=stop_distance_pct, stop_type=stop_type,
+                    trail_pct=trail_pct,
+                )
+            elif atr_value:
+                # Auto mode — existing logic
+                if side == "BUY":
+                    stop_rec = self._recommend_stop(price, atr_value, atr_pct, days_to_earnings)
+                else:
+                    stop_rec = self._recommend_stop_short(price, atr_value, atr_pct, days_to_earnings)
+
+        # Per-symbol execution cost history
+        exec_cost = None
+        try:
+            ec = get_execution_cost(symbol=symbol)
+            if ec and ec.get("trades", 0) >= 3:
+                exec_cost = {"avg_gap_pct": ec["avg_gap_pct"], "trades_observed": ec["trades"]}
+        except Exception as e:
+            logger.debug(f"Execution cost lookup failed for {symbol}: {e}")
+
+        data_snapshot = {
+            "price": price,
+            "bid": bid,
+            "ask": ask,
+            "spread": spread,
+            "spread_pct": spread_pct,
+            "atr": atr_value,
+            "atr_pct": atr_pct,
+            "days_to_earnings": days_to_earnings,
+            "iv_current": iv_info.iv_current if iv_info else None,
+            "iv_rank": iv_info.iv_rank if iv_info else None,
+            "session": session,
+            "minutes_to_open": minutes_to_open,
+            "minutes_to_close": minutes_to_close,
+            "volume": volume,
+            "execution_cost": exec_cost,
+        }
+
+        # Quantity scaling is applied in execute() before dispatch for all order paths.
+        # The universal gate+scaler in ToolExecutor.execute() mutates params before dispatch,
+        # so quantity arriving here is already the final safe value from canonical matrix.
+        # We keep a lightweight note in reasons for the plan_order response payload (observability for agent).
+        try:
+            from core.quality.quality_matrix import get_quality_matrix_service
+            m = get_quality_matrix_service().get_matrix()
+            # quantity was pre-scaled upstream; just record the active policy for transparency
+            reasons.append(
+                f"QualityMatrix (host-enforced): overall={m.overall_quality} rm={m.risk_multiplier:.2f} "
+                f"(pre-scaled quantity already applied before dispatch)"
+            )
+        except Exception as _scale_note_err:
+            logger.debug("QualityMatrix note in plan_order skipped: %s", _scale_note_err)
+
+        return {
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "intent": intent,
+            "urgency": urgency,
+            "recommendation": recommended,
+            "reasoning": reasons,
+            "suggested_params": suggested_params,
+            "stop_recommendation": stop_rec,
+            "data_snapshot": data_snapshot,
+            "graduated_param_id": graduated_param_id,
+            "agent_overrides": {
+                "order_type": order_type,
+                "stop_type": stop_type,
+                "stop_distance_pct": stop_distance_pct,
+                "trail_pct": trail_pct,
+                "limit_price": limit_price,
+            },
+        }
+
+    def _plan_entry(self, symbol, side, quantity, price, urgency,
+                    session, spread, spread_pct, minutes_to_open,
+                    minutes_to_close, atr_pct, limit_price=None):
+        """Entry order decision tree. Returns (order_type, reasons, params)."""
+        reasons = []
+        params = {"symbol": symbol, "side": side, "quantity": quantity}
+
+        if session == "premarket":
+            if limit_price is not None:
+                reasons.append(f"Premarket: LOO (limit-on-open) at ${limit_price:.2f} for opening auction")
+                params["limit_price"] = round(limit_price, 2)
+                return ("loo_order", reasons, params)
+            else:
+                reasons.append("Premarket: MOO (market-on-open) for opening auction fill")
+                return ("moo_order", reasons, params)
+
+        if session == "postmarket":
+            reasons.append("Extended hours (postmarket): only limit orders supported")
+            if price:
+                params["limit_price"] = round(price, 2)
+            return ("limit_order", reasons, params)
+
+        if session == "closed":
+            reasons.append("Market closed: cannot place order now")
+            return ("WAIT", reasons, {})
+
+        if minutes_to_open is not None and 0 < minutes_to_open <= 5:
+            reasons.append(f"Within {minutes_to_open} min of open: opening auction order")
+            return ("moo_order", reasons, params)
+
+        if minutes_to_close is not None and 0 < minutes_to_close <= 10:
+            reasons.append(f"Within {minutes_to_close} min of close: closing auction order")
+            return ("moc_order", reasons, params)
+
+        if price and quantity * price > 100_000:
+            reasons.append(f"Very large order (${quantity * price:,.0f}): TWAP for time distribution")
+            return ("twap_order", reasons, params)
+        if price and quantity * price > 50_000:
+            reasons.append(f"Large order (${quantity * price:,.0f}): VWAP for volume matching")
+            return ("vwap_order", reasons, params)
+
+        spread_tight = spread_pct is not None and spread_pct < 0.10
+        if urgency == "high" and spread_tight:
+            reasons.append(f"High urgency + tight spread ({spread_pct:.3f}%): market order")
+            return ("market_order", reasons, params)
+
+        if urgency == "high":
+            spread_str = f"{spread_pct:.3f}%" if spread_pct else "unknown"
+            reasons.append(f"High urgency, spread {spread_str}: adaptive with urgent priority")
+            params["priority"] = "Urgent"
+            return ("adaptive_order", reasons, params)
+
+        if spread_pct is not None and spread_pct > 0.30:
+            reasons.append(f"Wide spread ({spread_pct:.3f}%): midprice order to capture mid")
+            if price:
+                params["price_cap"] = round(price * 1.002, 2)
+            return ("midprice_order", reasons, params)
+
+        if spread_pct is not None and spread_pct > 0.10 and urgency == "low":
+            reasons.append(f"Moderate spread ({spread_pct:.3f}%) + low urgency: adaptive patient")
+            params["priority"] = "Patient"
+            return ("adaptive_order", reasons, params)
+
+        reasons.append("Normal conditions: adaptive order (IBKR algo for best execution)")
+        params["priority"] = "Normal"
+        return ("adaptive_order", reasons, params)
+
+    def _plan_exit(self, symbol, side, quantity, price, urgency,
+                   session, spread, spread_pct, minutes_to_close):
+        """Exit order decision tree. Returns (order_type, reasons, params)."""
+        reasons = []
+        params = {"symbol": symbol, "side": side, "quantity": quantity}
+
+        if session in ("premarket", "postmarket"):
+            reasons.append("Extended hours: limit order only")
+            if price:
+                params["limit_price"] = round(price, 2)
+            return ("limit_order", reasons, params)
+
+        if session == "closed":
+            reasons.append("Market closed")
+            return ("WAIT", reasons, {})
+
+        if urgency == "high":
+            reasons.append("High urgency exit: market order for guaranteed fill")
+            return ("market_order", reasons, params)
+
+        if minutes_to_close is not None and 0 < minutes_to_close <= 10:
+            reasons.append(f"Near close ({minutes_to_close} min): MOC for closing auction")
+            return ("moc_order", reasons, params)
+
+        if spread_pct is not None and spread_pct > 0.30:
+            reasons.append(f"Wide spread ({spread_pct:.3f}%): midprice for better fill")
+            return ("midprice_order", reasons, params)
+
+        reasons.append("Standard exit: adaptive order")
+        params["priority"] = "Normal"
+        return ("adaptive_order", reasons, params)
+
+    def _plan_stop(self, symbol, side, quantity, price, atr_value,
+                   atr_pct, days_to_earnings, spread, spread_pct):
+        """Stop order type decision tree. Returns (order_type, reasons, params)."""
+        reasons = []
+        params = {"symbol": symbol, "side": side, "quantity": quantity}
+
+        if not price or not atr_value:
+            reasons.append("Insufficient data: defaulting to basic stop")
+            return ("stop_order", reasons, params)
+
+        if days_to_earnings is not None and days_to_earnings <= 3:
+            reasons.append(f"Earnings in {days_to_earnings} days: stop_limit for gap protection")
+            if side == "SELL":
+                stop_price = round(price - atr_value, 2)
+                limit_price = round(stop_price - atr_value * 0.5, 2)
+            else:
+                stop_price = round(price + atr_value, 2)
+                limit_price = round(stop_price + atr_value * 0.5, 2)
+            params["stop_price"] = stop_price
+            params["limit_price"] = limit_price
+            reasons.append(f"Stop: ${stop_price}, Limit: ${limit_price} (0.5 ATR slippage buffer)")
+            return ("stop_limit", reasons, params)
+
+        if atr_pct and atr_pct > 3.0:
+            reasons.append(f"High volatility (ATR {atr_pct}%): trailing stop to ride momentum")
+            trail_pct = round(min(atr_pct * 1.5, 15.0) / 100, 4)
+            direction = "LONG" if side == "SELL" else "SHORT"
+            params = {
+                "symbol": symbol,
+                "quantity": quantity,
+                "direction": direction,
+                "trail_percent": trail_pct,
+            }
+            reasons.append(f"Trail: {trail_pct * 100:.1f}% (1.5x ATR%)")
+            return ("trailing_stop", reasons, params)
+
+        if spread_pct and spread_pct > 0.50:
+            reasons.append(f"Wide spread ({spread_pct:.2f}%): stop_limit to control fill price")
+            if side == "SELL":
+                stop_price = round(price - atr_value, 2)
+                limit_price = round(stop_price - (spread * 2 if spread else price * 0.005), 2)
+            else:
+                stop_price = round(price + atr_value, 2)
+                limit_price = round(stop_price + (spread * 2 if spread else price * 0.005), 2)
+            params["stop_price"] = stop_price
+            params["limit_price"] = limit_price
+            return ("stop_limit", reasons, params)
+
+        reasons.append("Standard conditions: basic stop order")
+        if side == "SELL":
+            stop_price = round(price - atr_value, 2)
+        else:
+            stop_price = round(price + atr_value, 2)
+        params["stop_price"] = stop_price
+        reasons.append(f"Stop: ${stop_price} (1 ATR from current)")
+        return ("stop_order", reasons, params)
+
+    def _build_agent_stop(self, price, side, atr_value, atr_pct,
+                          stop_distance_pct=None, stop_type=None, trail_pct=None):
+        """Build stop recommendation from agent-provided parameters.
+
+        The agent controls the stop. We just do the math.
+        Falls back to ATR-based defaults only for fields the agent didn't specify.
+        """
+        is_long = side == "BUY"
+
+        # Determine effective stop type
+        effective_type = stop_type or "fixed"
+        if trail_pct and not stop_type:
+            effective_type = "trailing"
+
+        # Determine effective stop distance
+        if stop_distance_pct is not None:
+            eff_dist_pct = float(stop_distance_pct)
+        elif trail_pct and effective_type == "trailing":
+            eff_dist_pct = float(trail_pct) * 100 if trail_pct > 1 else float(trail_pct) * 100
+        elif atr_pct:
+            eff_dist_pct = round(min(atr_pct * 1.5, 15.0), 2)
+        else:
+            eff_dist_pct = 5.0
+
+        risk_pct = round(eff_dist_pct, 2)
+
+        if effective_type == "trailing":
+            # Trail percent: agent may pass as decimal (0.08) or whole (8.0)
+            if trail_pct:
+                eff_trail = float(trail_pct)
+                if eff_trail > 1:
+                    eff_trail = eff_trail / 100  # Convert 8.0 -> 0.08
+            else:
+                eff_trail = eff_dist_pct / 100
+
+            return {
+                "stop_type": "trailing_stop",
+                "trail_percent": round(eff_trail, 4),
+                "direction": "LONG" if is_long else "SHORT",
+                "risk_pct": risk_pct,
+                "note": f"Agent: trailing {eff_trail * 100:.1f}%",
+            }
+        else:
+            # Fixed stop
+            if is_long:
+                stop_price = round(price * (1 - eff_dist_pct / 100), 2)
+            else:
+                stop_price = round(price * (1 + eff_dist_pct / 100), 2)
+
+            return {
+                "stop_type": "stop_order",
+                "stop_price": stop_price,
+                "side": "SELL" if is_long else "BUY",
+                "risk_pct": risk_pct,
+                "note": f"Agent: fixed stop {eff_dist_pct:.1f}% away",
+            }
+
+    def _recommend_stop(self, price, atr_value, atr_pct, days_to_earnings):
+        """Companion stop recommendation for long entry.
+
+        Uses plain stop orders (not stop_limit) to avoid Error 202
+        'Limit Price too far through Stop Price' rejections from IBKR.
+        For earnings plays, uses trailing stop instead of stop_limit.
+        """
+        stop_price = round(price - atr_value * 1.5, 2)
+        risk_pct = round((price - stop_price) / price * 100, 2)
+
+        if atr_pct and atr_pct > 3.0:
+            trail = round(min(atr_pct * 1.5, 15.0) / 100, 4)
+            return {
+                "stop_type": "trailing_stop",
+                "trail_percent": trail,
+                "direction": "LONG",
+                "risk_pct": risk_pct,
+                "note": f"Trailing {trail * 100:.1f}% (1.5x ATR%) | high volatility",
+            }
+
+        if days_to_earnings is not None and days_to_earnings <= 3:
+            # Tighter stop near earnings — but still plain stop to avoid IBKR rejection
+            tight_stop = round(price - atr_value * 1.0, 2)
+            tight_risk = round((price - tight_stop) / price * 100, 2)
+            return {
+                "stop_type": "stop_order",
+                "stop_price": tight_stop,
+                "side": "SELL",
+                "risk_pct": tight_risk,
+                "note": f"1.0 ATR below entry | EARNINGS in {days_to_earnings}d: tight stop",
+            }
+
+        return {
+            "stop_type": "stop_order",
+            "stop_price": stop_price,
+            "side": "SELL",
+            "risk_pct": risk_pct,
+            "note": "1.5 ATR below entry",
+        }
+
+    def _recommend_stop_short(self, price, atr_value, atr_pct, days_to_earnings):
+        """Companion stop recommendation for short entry.
+
+        Uses plain stop orders to avoid Error 202 stop_limit rejections.
+        """
+        stop_price = round(price + atr_value * 1.5, 2)
+        risk_pct = round((stop_price - price) / price * 100, 2)
+
+        if days_to_earnings is not None and days_to_earnings <= 3:
+            tight_stop = round(price + atr_value * 1.0, 2)
+            tight_risk = round((tight_stop - price) / price * 100, 2)
+            return {
+                "stop_type": "stop_order",
+                "stop_price": tight_stop,
+                "side": "BUY",
+                "risk_pct": tight_risk,
+                "note": f"1.0 ATR above entry (BUY stop) | EARNINGS in {days_to_earnings}d: tight stop",
+            }
+
+        return {
+            "stop_type": "stop_order",
+            "stop_price": stop_price,
+            "side": "BUY",
+            "risk_pct": risk_pct,
+            "note": "1.5 ATR above entry (BUY stop for short cover)",
+        }
+
+    def _enter_option(
+        self,
+        symbol: str,
+        strategy: str,
+        quantity: int = 1,
+        dte_target: int = 30,
+        delta_target: float = None,
+        max_spread_pct: float = 15.0,
+    ) -> dict:
+        """
+        Deterministic option contract selector.
+
+        Gathers market data, picks the optimal contract(s) for the requested
+        strategy, and returns a plan with dispatch_action + dispatch_params
+        ready for _dispatch().
+        """
+        if strategy not in self._OPTION_STRATEGY_DEFAULTS:
+            return {
+                "error": f"Unknown strategy '{strategy}'. Valid: {list(self._OPTION_STRATEGY_DEFAULTS.keys())}"
+            }
+
+        defaults = self._OPTION_STRATEGY_DEFAULTS[strategy]
+        delta = delta_target if delta_target is not None else defaults[0]
+        dte_min = defaults[1]
+        dte_max = defaults[2]
+
+        quote = self.data_provider.get_quote(symbol)
+        if not quote or not quote.last:
+            return {"error": f"No quote data for {symbol}"}
+        price = quote.last
+
+        iv_info = None
+        try:
+            iv_info = self.data_provider.get_iv_info(
+                symbol, dte_min=dte_min, dte_max=dte_max
+            )
+        except Exception as e:
+            logger.debug(f"IV info lookup failed for {symbol}: {e}")
+
+        atr_result = None
+        try:
+            atr_result = self.data_provider.get_atr(symbol)
+        except Exception as e:
+            logger.debug(f"ATR lookup failed for {symbol}: {e}")
+
+        earnings = None
+        try:
+            earnings = self.data_provider.get_earnings_info(symbol)
+        except Exception as e:
+            logger.debug(f"Earnings lookup failed for {symbol}: {e}")
+        days_to_earnings = earnings.days_until_earnings if earnings else None
+
+        earnings_warning = None
+        if days_to_earnings is not None and days_to_earnings <= 7:
+            earnings_warning = f"Earnings in {days_to_earnings} days - elevated IV/risk"
+
+        chain = self.data_provider.get_option_chain(
+            symbol, dte_range=(dte_min, dte_max)
+        )
+        if not chain or not chain.contracts:
+            return {"error": f"No option chain for {symbol} in DTE range {dte_min}-{dte_max}"}
+
+        data_snapshot = {
+            "price": price,
+            "iv_current": iv_info.iv_current if iv_info else None,
+            "iv_rank": iv_info.iv_rank if iv_info else None,
+            "atr": round(atr_result.value, 2) if atr_result else None,
+            "days_to_earnings": days_to_earnings,
+            "chain_contracts": len(chain.contracts),
+        }
+
+        if strategy in ("long_call", "long_put"):
+            result = self._select_single_leg(
+                symbol, strategy, chain, price, delta, dte_target,
+                max_spread_pct, quantity, iv_info, earnings_warning, data_snapshot
+            )
+            # In aggressive mode, auto-suggest a spread upgrade for simple legs
+            if PAPER_AGGRESSIVE and isinstance(result, dict) and "error" not in result:
+                upgrade = "bull_call_spread" if strategy == "long_call" else "bear_put_spread"
+                result["aggressive_suggestion"] = (
+                    f"AGGRESSIVE_PAPER: Consider upgrading to {upgrade} to reduce cost basis "
+                    f"and test multi-leg execution. Call enter_option with strategy='{upgrade}'."
+                )
+            return result
+
+        elif strategy in ("bull_call_spread", "bear_put_spread"):
+            return self._select_vertical_spread(
+                symbol, strategy, chain, price, delta, dte_target,
+                max_spread_pct, quantity, iv_info, earnings_warning, data_snapshot
+            )
+
+        elif strategy == "iron_condor":
+            return self._select_iron_condor(
+                symbol, chain, price, delta, dte_target,
+                max_spread_pct, quantity, iv_info, earnings_warning, data_snapshot
+            )
+
+        elif strategy in ("covered_call", "cash_secured_put", "protective_put"):
+            return self._select_income_protection(
+                symbol, strategy, chain, price, delta, dte_target,
+                max_spread_pct, quantity, iv_info, earnings_warning, data_snapshot
+            )
+
+        elif strategy in ("straddle", "strangle"):
+            return self._select_straddle_strangle(
+                symbol, strategy, chain, price, delta, dte_target,
+                max_spread_pct, quantity, iv_info, earnings_warning, data_snapshot
+            )
+
+        return {"error": f"Strategy '{strategy}' not yet implemented"}
+
+    @staticmethod
+    def _best_contract(candidates, delta_target, max_spread_pct):
+        """Pick best contract: filter spread, sort by delta proximity."""
+        valid = [c for c in candidates if c.spread_pct is not None and c.spread_pct <= max_spread_pct]
+        if not valid:
+            valid = candidates
+        valid.sort(key=lambda c: abs((abs(c.delta) if c.delta else 0) - delta_target))
+        return valid[0] if valid else None
+
+    @staticmethod
+    def _contract_dict(c):
+        """Format an OptionContract for output."""
+        return {
+            "strike": c.strike,
+            "expiration": c.expiration,
+            "right": "C" if c.side == "call" else "P",
+            "delta": c.delta,
+            "gamma": c.gamma,
+            "theta": c.theta,
+            "vega": c.vega,
+            "iv": c.iv,
+            "dte": c.dte,
+            "bid": c.bid,
+            "ask": c.ask,
+            "mid": c.mid,
+            "spread_pct": round(c.spread_pct, 1) if c.spread_pct else None,
+        }
+
+    def _select_single_leg(self, symbol, strategy, chain, price, delta,
+                           dte_target, max_spread_pct, quantity,
+                           iv_info, earnings_warning, data_snapshot):
+        """Select contract for long_call or long_put."""
+        is_call = strategy == "long_call"
+        contracts = chain.calls() if is_call else chain.puts()
+
+        contracts = [c for c in contracts
+                     if c.dte is not None and abs(c.dte - dte_target) <= 15]
+        contracts = [c for c in contracts
+                     if c.delta is not None and abs(abs(c.delta) - delta) <= 0.15]
+
+        if not contracts:
+            return {"error": f"No {'call' if is_call else 'put'} contracts near delta {delta} and DTE {dte_target}"}
+
+        best = self._best_contract(contracts, delta, max_spread_pct)
+        if not best:
+            return {"error": "No contracts pass spread filter"}
+
+        cost = (best.ask or best.mid or 0) * 100 * quantity
+
+        if self.gateway and self.gateway.cash_value > 0 and cost > self.gateway.cash_value:
+            return {
+                "error": f"Insufficient cash: need ${cost:.2f}, have ${self.gateway.cash_value:.2f}",
+                "selected_contract": self._contract_dict(best),
+            }
+
+        return {
+            "strategy": strategy,
+            "symbol": symbol,
+            "selected_contract": self._contract_dict(best),
+            "estimated_cost": round(cost, 2),
+            "max_loss": round(cost, 2),
+            "iv_context": {
+                "iv_current": iv_info.iv_current if iv_info else None,
+                "iv_rank": iv_info.iv_rank if iv_info else None,
+            },
+            "earnings_warning": earnings_warning,
+            "data_snapshot": data_snapshot,
+            "dispatch_action": "buy_option",
+            "dispatch_params": {
+                "symbol": symbol,
+                "expiration": best.expiration,
+                "strike": best.strike,
+                "right": "C" if is_call else "P",
+                "quantity": quantity,
+            },
+        }
+
+    def _select_vertical_spread(self, symbol, strategy, chain, price, delta,
+                                dte_target, max_spread_pct, quantity,
+                                iv_info, earnings_warning, data_snapshot):
+        """Select contracts for bull_call_spread or bear_put_spread."""
+        is_bull_call = strategy == "bull_call_spread"
+        contracts = chain.calls() if is_bull_call else chain.puts()
+
+        contracts = [c for c in contracts
+                     if c.dte is not None and abs(c.dte - dte_target) <= 15]
+
+        if len(contracts) < 2:
+            return {"error": f"Not enough contracts for {strategy}"}
+
+        expirations = {}
+        for c in contracts:
+            expirations.setdefault(c.expiration, []).append(c)
+
+        best_exp = min(expirations.keys(),
+                       key=lambda e: abs((expirations[e][0].dte or dte_target) - dte_target))
+        exp_contracts = expirations[best_exp]
+        exp_contracts.sort(key=lambda c: c.strike)
+
+        short_delta = delta * 0.5
+        long_candidates = [c for c in exp_contracts
+                           if c.delta and abs(abs(c.delta) - delta) <= 0.15]
+        short_candidates = [c for c in exp_contracts
+                            if c.delta and abs(abs(c.delta) - short_delta) <= 0.15]
+
+        if not long_candidates or not short_candidates:
+            return {"error": f"Cannot find suitable long/short legs for {strategy}"}
+
+        long_leg = self._best_contract(long_candidates, delta, max_spread_pct * 2)
+        short_leg = self._best_contract(short_candidates, short_delta, max_spread_pct * 2)
+
+        if not long_leg or not short_leg or long_leg.strike == short_leg.strike:
+            return {"error": "Could not form valid spread — legs have same strike"}
+
+        if is_bull_call:
+            long_strike = min(long_leg.strike, short_leg.strike)
+            short_strike = max(long_leg.strike, short_leg.strike)
+            long_c = next((c for c in exp_contracts if c.strike == long_strike), long_leg)
+            short_c = next((c for c in exp_contracts if c.strike == short_strike), short_leg)
+        else:
+            long_strike = max(long_leg.strike, short_leg.strike)
+            short_strike = min(long_leg.strike, short_leg.strike)
+            long_c = next((c for c in exp_contracts if c.strike == long_strike), long_leg)
+            short_c = next((c for c in exp_contracts if c.strike == short_strike), short_leg)
+
+        width = abs(long_strike - short_strike)
+        debit = ((long_c.ask or long_c.mid or 0) - (short_c.bid or short_c.mid or 0))
+        max_loss = round(debit * 100 * quantity, 2)
+
+        return {
+            "strategy": strategy,
+            "symbol": symbol,
+            "long_leg": self._contract_dict(long_c),
+            "short_leg": self._contract_dict(short_c),
+            "spread_width": width,
+            "estimated_debit": round(debit, 2),
+            "max_loss": max_loss,
+            "max_profit": round((width - debit) * 100 * quantity, 2),
+            "iv_context": {
+                "iv_current": iv_info.iv_current if iv_info else None,
+                "iv_rank": iv_info.iv_rank if iv_info else None,
+            },
+            "earnings_warning": earnings_warning,
+            "data_snapshot": data_snapshot,
+            "dispatch_action": "vertical_spread",
+            "dispatch_params": {
+                "symbol": symbol,
+                "expiration": best_exp,
+                "long_strike": long_c.strike,
+                "short_strike": short_c.strike,
+                "right": "C" if is_bull_call else "P",
+                "quantity": quantity,
+            },
+        }
+
+    def _select_iron_condor(self, symbol, chain, price, delta, dte_target,
+                            max_spread_pct, quantity,
+                            iv_info, earnings_warning, data_snapshot):
+        """Select 4 legs for iron condor."""
+        calls = chain.calls()
+        puts = chain.puts()
+
+        calls = [c for c in calls if c.dte is not None and abs(c.dte - dte_target) <= 20]
+        puts = [c for c in puts if c.dte is not None and abs(c.dte - dte_target) <= 20]
+
+        if not calls or not puts:
+            return {"error": "Not enough contracts for iron condor"}
+
+        all_dtes = {c.expiration: c.dte for c in calls + puts if c.dte}
+        if not all_dtes:
+            return {"error": "No DTE data available"}
+        best_exp = min(all_dtes.keys(), key=lambda e: abs(all_dtes[e] - dte_target))
+
+        exp_calls = sorted([c for c in calls if c.expiration == best_exp], key=lambda c: c.strike)
+        exp_puts = sorted([c for c in puts if c.expiration == best_exp], key=lambda c: c.strike)
+
+        short_call_candidates = [c for c in exp_calls if c.delta and abs(abs(c.delta) - delta) <= 0.10]
+        short_put_candidates = [c for c in exp_puts if c.delta and abs(abs(c.delta) - delta) <= 0.10]
+
+        if not short_call_candidates or not short_put_candidates:
+            return {"error": f"Cannot find short legs near delta {delta}"}
+
+        short_call = self._best_contract(short_call_candidates, delta, max_spread_pct * 3)
+        short_put = self._best_contract(short_put_candidates, delta, max_spread_pct * 3)
+
+        long_call = next((c for c in exp_calls if c.strike > short_call.strike), None)
+        long_put = next((c for c in reversed(exp_puts) if c.strike < short_put.strike), None)
+
+        if not long_call or not long_put:
+            return {"error": "Cannot find long wings for iron condor"}
+
+        credit = ((short_call.bid or 0) + (short_put.bid or 0)
+                  - (long_call.ask or 0) - (long_put.ask or 0))
+        call_width = long_call.strike - short_call.strike
+        put_width = short_put.strike - long_put.strike
+        max_width = max(call_width, put_width)
+        max_loss = round((max_width - credit) * 100 * quantity, 2)
+
+        return {
+            "strategy": "iron_condor",
+            "symbol": symbol,
+            "short_call": self._contract_dict(short_call),
+            "long_call": self._contract_dict(long_call),
+            "short_put": self._contract_dict(short_put),
+            "long_put": self._contract_dict(long_put),
+            "estimated_credit": round(credit, 2),
+            "max_loss": max_loss,
+            "max_profit": round(credit * 100 * quantity, 2),
+            "iv_context": {
+                "iv_current": iv_info.iv_current if iv_info else None,
+                "iv_rank": iv_info.iv_rank if iv_info else None,
+            },
+            "earnings_warning": earnings_warning,
+            "data_snapshot": data_snapshot,
+            "dispatch_action": "iron_condor",
+            "dispatch_params": {
+                "symbol": symbol,
+                "expiration": best_exp,
+                "put_long_strike": long_put.strike,
+                "put_short_strike": short_put.strike,
+                "call_short_strike": short_call.strike,
+                "call_long_strike": long_call.strike,
+                "quantity": quantity,
+            },
+        }
+
+    def _select_income_protection(self, symbol, strategy, chain, price, delta,
+                                  dte_target, max_spread_pct, quantity,
+                                  iv_info, earnings_warning, data_snapshot):
+        """Select contract for covered_call, cash_secured_put, or protective_put."""
+        if strategy == "covered_call":
+            contracts = chain.calls()
+        else:
+            contracts = chain.puts()
+
+        contracts = [c for c in contracts
+                     if c.dte is not None and abs(c.dte - dte_target) <= 15]
+        contracts = [c for c in contracts
+                     if c.delta is not None and abs(abs(c.delta) - delta) <= 0.15]
+
+        if not contracts:
+            return {"error": f"No contracts near delta {delta} and DTE {dte_target} for {strategy}"}
+
+        best = self._best_contract(contracts, delta, max_spread_pct)
+        if not best:
+            return {"error": "No contracts pass spread filter"}
+
+        if strategy == "covered_call":
+            dispatch_action = "covered_call"
+            dispatch_params = {
+                "symbol": symbol,
+                "expiration": best.expiration,
+                "strike": best.strike,
+                "shares": 100 * quantity,
+            }
+            est_credit = (best.bid or best.mid or 0) * 100 * quantity
+        elif strategy == "cash_secured_put":
+            dispatch_action = "cash_secured_put"
+            dispatch_params = {
+                "symbol": symbol,
+                "expiration": best.expiration,
+                "strike": best.strike,
+                "contracts": quantity,
+            }
+            est_credit = (best.bid or best.mid or 0) * 100 * quantity
+            collateral = best.strike * 100 * quantity
+            if self.gateway and self.gateway.cash_value > 0 and collateral > self.gateway.cash_value:
+                return {
+                    "error": f"Insufficient cash for CSP collateral: need ${collateral:.2f}, have ${self.gateway.cash_value:.2f}",
+                    "selected_contract": self._contract_dict(best),
+                }
+        else:  # protective_put
+            dispatch_action = "protective_put"
+            dispatch_params = {
+                "symbol": symbol,
+                "expiration": best.expiration,
+                "strike": best.strike,
+                "shares": 100 * quantity,
+            }
+            est_credit = -((best.ask or best.mid or 0) * 100 * quantity)
+
+        return {
+            "strategy": strategy,
+            "symbol": symbol,
+            "selected_contract": self._contract_dict(best),
+            "estimated_premium": round(abs(est_credit), 2),
+            "premium_type": "credit" if est_credit > 0 else "debit",
+            "iv_context": {
+                "iv_current": iv_info.iv_current if iv_info else None,
+                "iv_rank": iv_info.iv_rank if iv_info else None,
+            },
+            "earnings_warning": earnings_warning,
+            "data_snapshot": data_snapshot,
+            "dispatch_action": dispatch_action,
+            "dispatch_params": dispatch_params,
+        }
+
+    def _select_straddle_strangle(self, symbol, strategy, chain, price, delta,
+                                  dte_target, max_spread_pct, quantity,
+                                  iv_info, earnings_warning, data_snapshot):
+        """Select contracts for straddle or strangle."""
+        calls = chain.calls()
+        puts = chain.puts()
+
+        calls = [c for c in calls if c.dte is not None and abs(c.dte - dte_target) <= 15]
+        puts = [c for c in puts if c.dte is not None and abs(c.dte - dte_target) <= 15]
+
+        if not calls or not puts:
+            return {"error": f"Not enough contracts for {strategy}"}
+
+        if strategy == "straddle":
+            all_strikes = sorted(set(c.strike for c in calls + puts))
+            atm_strike = min(all_strikes, key=lambda s: abs(s - price))
+
+            atm_calls = [c for c in calls if c.strike == atm_strike]
+            atm_puts = [c for c in puts if c.strike == atm_strike]
+
+            if not atm_calls or not atm_puts:
+                return {"error": "No ATM contracts found for straddle"}
+
+            call = min(atm_calls, key=lambda c: abs((c.dte or dte_target) - dte_target))
+            put = next((p for p in atm_puts if p.expiration == call.expiration), atm_puts[0])
+
+            cost = ((call.ask or call.mid or 0) + (put.ask or put.mid or 0)) * 100 * quantity
+
+            return {
+                "strategy": "straddle",
+                "symbol": symbol,
+                "call": self._contract_dict(call),
+                "put": self._contract_dict(put),
+                "strike": atm_strike,
+                "estimated_cost": round(cost, 2),
+                "max_loss": round(cost, 2),
+                "iv_context": {
+                    "iv_current": iv_info.iv_current if iv_info else None,
+                    "iv_rank": iv_info.iv_rank if iv_info else None,
+                },
+                "earnings_warning": earnings_warning,
+                "data_snapshot": data_snapshot,
+                "dispatch_action": "straddle",
+                "dispatch_params": {
+                    "symbol": symbol,
+                    "expiration": call.expiration,
+                    "strike": atm_strike,
+                    "quantity": quantity,
+                },
+            }
+
+        else:  # strangle
+            call_candidates = [c for c in calls
+                               if c.delta and abs(abs(c.delta) - delta) <= 0.10]
+            put_candidates = [c for c in puts
+                              if c.delta and abs(abs(c.delta) - delta) <= 0.10]
+
+            if not call_candidates or not put_candidates:
+                return {"error": f"Cannot find OTM legs near delta {delta} for strangle"}
+
+            call = self._best_contract(call_candidates, delta, max_spread_pct * 2)
+            put_same_exp = [p for p in put_candidates if p.expiration == call.expiration]
+            put = self._best_contract(put_same_exp or put_candidates, delta, max_spread_pct * 2)
+
+            cost = ((call.ask or call.mid or 0) + (put.ask or put.mid or 0)) * 100 * quantity
+
+            return {
+                "strategy": "strangle",
+                "symbol": symbol,
+                "call": self._contract_dict(call),
+                "put": self._contract_dict(put),
+                "estimated_cost": round(cost, 2),
+                "max_loss": round(cost, 2),
+                "iv_context": {
+                    "iv_current": iv_info.iv_current if iv_info else None,
+                    "iv_rank": iv_info.iv_rank if iv_info else None,
+                },
+                "earnings_warning": earnings_warning,
+                "data_snapshot": data_snapshot,
+                "dispatch_action": "strangle",
+                "dispatch_params": {
+                    "symbol": symbol,
+                    "expiration": call.expiration,
+                    "put_strike": put.strike,
+                    "call_strike": call.strike,
+                    "quantity": quantity,
+                },
+            }
+
+    def _order_fingerprint(self, action: str, params: dict) -> str:
+        """Build a dedup fingerprint for an order action."""
+        parts = [
+            action,
+            str(params.get("symbol", "")).upper(),
+            str(params.get("side", params.get("direction", ""))).upper(),
+            str(params.get("quantity", params.get("total_quantity", 0))),
+            str(params.get("intent", "")),
+        ]
+        # For option spreads include strategy-identifying params
+        for key in ("strike", "expiry", "right", "strategy",
+                    "long_strike", "short_strike", "call_strike", "put_strike"):
+            val = params.get(key)
+            if val is not None:
+                parts.append(f"{key}={val}")
+        return "|".join(parts)
+
+    def _check_idempotency(self, action: str, params: dict) -> dict | None:
+        """Return rejection dict if this order was submitted within 60s, else None."""
+        import time
+        if action not in self._order_actions:
+            return None
+        fp = self._order_fingerprint(action, params)
+        now = time.time()
+        # Prune stale entries
+        self._recent_orders = {
+            k: v for k, v in self._recent_orders.items() if now - v < 60
+        }
+        if fp in self._recent_orders:
+            elapsed = round(now - self._recent_orders[fp], 1)
+            logger.warning(f"Duplicate order suppressed ({elapsed}s ago): {fp}")
+            return {
+                "error": "duplicate_suppressed",
+                "reason": f"Identical order submitted {elapsed}s ago (60s cooldown)",
+                "fingerprint": fp,
+            }
+        # Record this order
+        self._recent_orders[fp] = now
+        return None
+
+    async def _verify_order_active(self, order_id: int, symbol: str | None = None, wait_seconds: float = 0.6) -> tuple[dict, bool]:
+        """Verify newly-submitted order remains active after a short broker-processing window."""
+        if not self.gateway:
+            return {"verified": False, "reason": "no_gateway"}, True
+
+        try:
+            await _safe_sleep(wait_seconds)
+            orders = await self.gateway.get_open_orders()
+            for order in orders:
+                if int(order.get("order_id", 0)) == int(order_id):
+                    status = order.get("status")
+                    return {
+                        "verified": True,
+                        "order_id": int(order_id),
+                        "status": status,
+                    }, True
+
+            return {
+                "error": "order_cancelled_immediately",
+                "order_id": int(order_id),
+                "symbol": symbol,
+                "reason": "Order missing from active open orders shortly after placement",
+            }, False
+        except Exception as exc:
+            logger.warning(f"Post-submit verify failed for order {order_id}: {exc}")
+            # Don't fail hard on verification transport issues.
+            return {
+                "verified": False,
+                "order_id": int(order_id),
+                "reason": f"verification_unavailable: {exc}",
+            }, True
+
+    async def execute(self, action: str, params: dict) -> 'ToolResult':
+        """Execute a tool and return structured ToolResult."""
+        from core.log_context import bind_trade_context, refresh_trader_cycle_context, unbind_trade_context
+
+        refresh_trader_cycle_context()
+        try:
+            # Normalize case — LLMs sometimes send ATR, Quote, etc.
+            action = action.strip().lower() if isinstance(action, str) else action
+
+            # Resolve aliases before validation
+            action = _ALIASES.get(action, action)
+
+            # Basic validation: check action exists in registry
+            # buy/sell pass through — _dispatch restructures their params into plan_order
+            from core.tool_registry import get_tool_registry
+
+            registry = get_tool_registry()
+            if (
+                registry.get_handler(action) is None
+                and action not in ("wait", "think", "feedback", "done", "buy", "sell")
+            ):
+                err = {"error": f"Unknown action: {action}", "valid_actions": get_valid_actions()[:25]}
+                return ToolResult(
+                    action=action, data=err, success=False,
+                    raw_json=json.dumps(err, separators=(',',':'), default=str),
+                )
+
+            reg_err = registry.validate_dispatch(
+                action,
+                params if isinstance(params, dict) else {},
+                gateway_connected=bool(self.gateway),
+            )
+            if reg_err:
+                err = {"error": reg_err, "valid_actions": get_valid_actions()[:25]}
+                return ToolResult(
+                    action=action, data=err, success=False,
+                    raw_json=json.dumps(err, separators=(",", ":"), default=str),
+                )
+
+            # Check broker connection for order actions
+            if action in _ORDER_ACTIONS and not self.gateway:
+                err = {"error": f"Tool '{action}' requires broker connection"}
+                return ToolResult(
+                    action=action, data=err, success=False,
+                    raw_json=json.dumps(err),
+                )
+
+            # ── QualityMatrix hard gate ──
+            # Delegates to the enriched enforcement APIs in core/quality.
+            # This is the authoritative host-level rejection (hard control).
+            # LLM sees the policy via prompt/tools but cannot evade the gate.
+            try:
+                from core.quality.quality_matrix import get_quality_matrix_service
+                from core.runtime.operating_context import get_operating_context
+
+                ctx = get_operating_context()
+                svc = get_quality_matrix_service()
+                m = svc.get_matrix()
+
+                # Observability: log the active policy for every tool dispatch (debug)
+                try:
+                    m.recommended_policies(params.get("symbol") if isinstance(params, dict) else None)
+                    logger.debug(
+                        "QualityMatrix policy for action=%s: overall=%s rm=%.2f blocked=%s force_cons=%s",
+                        action,
+                        m.overall_quality,
+                        m.risk_multiplier,
+                        m.blocked_tool_categories,
+                        m.force_conservative_reasoning,
+                    )
+                except Exception:
+                    pass
+
+                # Prefer core matrix decision (strong unification); fall back to old path only on total failure
+                is_ind = getattr(ctx, "is_independent_mode", False)
+                allowed, reason = m.should_allow_tool(action, params, is_independent_mode=is_ind)
+
+                if not allowed:
+                    err = {
+                        "error": reason or f"Tool '{action}' REJECTED by QualityMatrix (hard host enforcement).",
+                        "quality": m.overall_quality,
+                        "risk_mult": round(m.risk_multiplier, 3),
+                        "blocked_by": "QualityMatrix",
+                        "enforcement": "quality_matrix",
+                    }
+                    logger.warning(
+                        "QualityMatrix STRONG hard-block: action=%s q=%s rm=%.2f reason=%s",
+                        action, m.overall_quality, m.risk_multiplier, (reason or "")[:120]
+                    )
+                    self._record_tool_for_quality_matrix(action, params, success=False)
+                    return ToolResult(
+                        action=action, data=err, success=False,
+                        raw_json=json.dumps(err, default=str),
+                    )
+
+                # Also surface the scaling hint for downstream order handlers (they will call m.get_scaled_quantity)
+                # This keeps the gate single source while still allowing partial progress for info tools.
+            except Exception as _qgate:
+                # Never let quality gate crash execution — degrade open (safe default)
+                logger.debug("QualityMatrix strong gate bypassed (non-fatal): %s", _qgate)
+
+            # ── QualityMatrix quantity scaling on all order actions ──
+            # Previously only plan_order received hard scaling. Now every direct market/limit/stop etc.
+            # (and the alias-rewritten buy/sell) receives the authoritative host scaling before any
+            # broker call. This is non-bypassable enforcement.
+            try:
+                from core.quality.quality_matrix import get_quality_matrix_service
+                svc = get_quality_matrix_service()
+                m = svc.get_matrix()
+                if isinstance(params, dict) and "quantity" in params:
+                    orig_qty = params.get("quantity")
+                    try:
+                        orig_qty_f = float(orig_qty)
+                    except Exception:
+                        orig_qty_f = 1.0
+                    sym = params.get("symbol") if isinstance(params.get("symbol"), str) else None
+                    intent = params.get("intent", "entry") if isinstance(params, dict) else "entry"
+                    scaled = m.get_scaled_quantity(orig_qty_f, symbol=sym, intent=intent)
+                    if scaled != int(orig_qty_f) and scaled >= 1:
+                        params["quantity"] = int(scaled)
+                        logger.warning(
+                            "QualityMatrix hard scaling (direct order path): %s %s → %s (q=%s rm=%.2f)",
+                            action, int(orig_qty_f), scaled, m.overall_quality, m.risk_multiplier
+                        )
+            except Exception as _scale_all_err:
+                logger.debug("QualityMatrix universal scaling skipped: %s", _scale_all_err)
+
+            # Universe confinement: ENTRIES into new exposure must be in
+            # the allowed universe (research universe ∪ active attention ∪
+            # current positions).  Exits/closes/rolls are always allowed.
+            # Aliases ``buy``/``sell`` are checked too — same symbol field.
+            if (action in _ORDER_ACTIONS or action in ("buy", "sell")) \
+                    and action not in _EXIT_ORDER_ACTIONS \
+                    and os.getenv("ABC_SIMULATION") != "1":
+                sym_raw = (params or {}).get("symbol")
+                if isinstance(sym_raw, str) and sym_raw.strip():
+                    sym = sym_raw.strip().upper()
+                    allowed = _allowed_trade_universe()
+                    # Always allow if we have a current position in the symbol
+                    has_position = False
+                    try:
+                        if self.gateway is not None:
+                            for item in (self.gateway.get_cached_portfolio() or []):
+                                if item.contract.symbol.upper() == sym and item.position != 0:
+                                    has_position = True
+                                    break
+                    except Exception:
+                        pass
+                    if not has_position and allowed and sym not in allowed:
+                        err = {
+                            "error": (
+                                f"Symbol {sym!r} is outside the allowed trading universe. "
+                                f"Use research tools to investigate, or add it via "
+                                f"update_working_memory(section='watching_for', "
+                                f"metadata={{'symbol': '{sym}', ...}}) to register attention."
+                            ),
+                            "allowed_size": len(allowed),
+                        }
+                        logger.warning(
+                            "Universe guard blocked %s on %s (allowed=%d)",
+                            action, sym, len(allowed),
+                        )
+                        self._record_tool_for_quality_matrix(action, params, success=False)
+                        return ToolResult(
+                            action=action, data=err, success=False,
+                            raw_json=json.dumps(err, separators=(',',':'), default=str),
+                        )
+
+            result = await self._dispatch(action, params)
+            payload = self._standardize_tool_payload(result)
+            # Defense-in-depth: enforce the contract before the result reaches
+            # the agent loop. _standardize_tool_payload should always produce a
+            # valid envelope; if it doesn't, fail loudly here rather than
+            # leaking malformed JSON into the LLM context.
+            try:
+                validate_envelope(payload)
+            except ValueError as ve:
+                logger.error(
+                    f"Tool '{action}' produced invalid envelope: {ve} "
+                    f"(payload keys={list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__})"
+                )
+                payload = {
+                    "success": False,
+                    "error": f"Internal envelope validation failed: {ve}",
+                    "is_realtime": False,
+                    "data_warning": None,
+                }
+
+            self._record_tool_for_quality_matrix(action, params, success=bool(payload.get("success")))
+
+            if action in _ORDER_ACTIONS and isinstance(payload, dict):
+                inner = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                if isinstance(inner, dict):
+                    oid = inner.get("order_id")
+                    if oid is not None:
+                        bind_trade_context(trade_id=str(oid), order_id=oid)
+
+            sym = (params or {}).get("symbol") if isinstance(params, dict) else None
+            logger.info(
+                "tool_executed",
+                action=action,
+                symbol=sym,
+                success=bool(payload.get("success")),
+            )
+
+            return ToolResult(
+                action=action,
+                data=payload,
+                success=bool(payload.get("success")),
+                raw_json=json.dumps(payload, separators=(',',':'), default=str),
+            )
+        except Exception as e:
+            logger.error("tool_error", action=action, error=str(e))
+            payload = {
+                "success": False,
+                "data": None,
+                "error": str(e),
+                "is_realtime": False,
+                "data_warning": None,
+            }
+            return ToolResult(
+                action=action,
+                data=payload,
+                success=False,
+                raw_json=json.dumps(payload),
+            )
+        finally:
+            unbind_trade_context()
+
+    async def _dispatch(self, action: str, params: dict) -> Any:
+        """Route action to handler via registry."""
+        # Alias common LLM verbs to valid tools to prevent no-op failures.
+        if action in ("buy", "sell"):
+            symbol = params.get("symbol")
+            quantity = params.get("quantity")
+            if not symbol or quantity is None:
+                return {"error": f"Invalid {action} action: symbol and quantity required"}
+            side = "BUY" if action == "buy" else "SELL"
+            # Auto-detect intent: if selling a LONG or buying a SHORT, it's an exit
+            intent = params.get("intent", None)
+            if intent is None:
+                # Check cached portfolio synchronously for intent detection
+                _portfolio = self.gateway.get_cached_portfolio() if self.gateway else []
+                _pos_match = None
+                for _item in _portfolio:
+                    if _item.contract.symbol.upper() == symbol.upper() and _item.position != 0:
+                        _pos_match = _item
+                        break
+                if _pos_match and side == "SELL" and _pos_match.position > 0:
+                    intent = "exit"
+                elif _pos_match and side == "BUY" and _pos_match.position < 0:
+                    intent = "exit"
+                else:
+                    intent = "entry"
+            elif intent in ("rotation", "close", "trim"):
+                # LLM explicitly says it's closing — ensure exit-like behavior
+                pass  # Keep the intent as-is but it's already in stop_skipped list
+            orig = params  # Save original before rebuilding
+            params = {
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "intent": intent,
+                "execute": orig.get("execute", True),
+            }
+            # Pass through any agent overrides from original params
+            for key in ("stop_distance_pct", "stop_type", "trail_pct",
+                        "order_type", "limit_price"):
+                val = orig.get(key)
+                if val is not None:
+                    params[key] = val
+            action = "plan_order"
+
+        # ── Universe advisory (information only) ────────────────
+        # The research subsystem prioritises a specific set of symbols, but the
+        # agent is free to trade any liquid name. We no longer hard-block trades
+        # outside the research universe — the agent has the context to decide.
+
+        # Normalize side: BUY_TO_OPEN/BUY_TO_CLOSE → BUY, SELL_TO_OPEN/SELL_TO_CLOSE → SELL
+        _side_raw = params.get("side", "")
+        if isinstance(_side_raw, str) and ("_TO_" in _side_raw.upper()):
+            _norm = _side_raw.upper().split("_")[0]  # BUY or SELL
+            params["side"] = _norm
+
+        # ── Option symbol redirect (BEFORE cash guard) ─────────
+        # If LLM passes an option symbol (OCC, space-separated, or underscore)
+        # to a stock order tool, parse it and redirect to close_option / buy_option.
+        if action in ("limit_order", "market_order", "plan_order",
+                     "bracket_order", "stop_order", "trailing_stop",
+                     "stop_limit", "adaptive_order"):
+            _sym = (params.get("symbol") or "")
+            _occ = _parse_option_symbol(_sym)
+            if _occ:
+                # Detect side: if Grok says SELL or intent is exit/close, it's a close
+                _raw_side = (params.get("side") or "").upper()
+                _raw_intent = (params.get("intent") or "").lower()
+                _is_sell = (_raw_side == "SELL" or _raw_intent in ("exit", "close", "trim", "protect")
+                           or action in ("trailing_stop", "stop_order"))
+                qty = params.get("quantity", 1)
+                if _is_sell:
+                    logger.info(f"Option redirect: {action}({_sym}) → close_option({_occ['underlying']}, {_occ['expiration']}, {_occ['strike']}, {_occ['right']})")
+                    action = "close_option"
+                else:
+                    logger.info(f"Option redirect: {action}({_sym}) → buy_option({_occ['underlying']}, {_occ['expiration']}, {_occ['strike']}, {_occ['right']})")
+                    action = "buy_option"
+                # Preserve limit_price from original params (e.g. limit_order → close_option)
+                _limit = params.get("limit_price") or params.get("price")
+                params = {
+                    "symbol": _occ["underlying"],
+                    "expiration": _occ["expiration"],
+                    "strike": _occ["strike"],
+                    "right": _occ["right"],
+                    "quantity": int(qty),
+                }
+                if _limit is not None:
+                    params["limit_price"] = _limit
+
+        # STRICT cash-only guardrail at dispatch level — catches direct order
+        # calls (market_order, limit_order, etc.) that bypass plan_order.
+        # Skip for option-specific tools (they handle their own validation).
+        if (self.cash_only
+                and action in self._order_actions
+                and action not in self._OPTION_ACTIONS_SKIP_CASH_CHECK):
+            side = params.get("side", "").upper()
+            symbol = (params.get("symbol") or "").upper()
+            intent = params.get("intent", "entry").lower()
+            cash_only_err = self._check_cash_only(side, symbol, intent)
+            if cash_only_err:
+                return cash_only_err
+
+        # Normalize expiration formats (Unix timestamp / YYYY-MM-DD → YYYYMMDD)
+        # so IBKR never receives raw timestamps from MarketData API.
+        for _ek in ("expiration", "near_expiration", "far_expiration",
+                    "old_expiration", "new_expiration"):
+            _ev = params.get(_ek)
+            if _ev:
+                params[_ek] = _normalize_expiration(str(_ev))
+
+        from core.tool_registry import get_tool_registry
+
+        handler = get_tool_registry().get_handler(action)
+        if handler is None:
+            valid = get_valid_actions()
+            return {
+                "error": f"Unknown action: {action}",
+                "hint": "Use plan_order for entries/exits. Use market_order/limit_order for direct execution.",
+                "valid_actions": valid,
+            }
+        result = await handler(self, params)
+        return merge_bare_stock_entry_advisory(action, params, result)
